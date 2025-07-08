@@ -1,5 +1,5 @@
 {
-    "Comment": "MLB Data Pipeline - 10 Year Historical Backfill",
+    "Comment": "MLB Data Pipeline - 4 Year Historical Backfill",
     "StartAt": "InitializePipeline",
     "States": {
       "InitializePipeline": {
@@ -135,7 +135,7 @@
       "PipelineComplete": {
         "Type": "Pass",
         "Result": {
-          "message": "10-year historical backfill completed",
+          "message": "4-year historical backfill completed",
           "timestamp.$": "$$.State.EnteredTime"
         },
         "End": true

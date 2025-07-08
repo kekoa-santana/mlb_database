@@ -105,11 +105,6 @@ def store_dataframe_to_rds(df: pd.DataFrame, table_name: str, if_exists: str = '
 def get_season_date_ranges() -> Dict[int, tuple]:
     """Return optimized date ranges for each MLB season (regular season only)"""
     return {
-        2016: (date(2016, 4, 3), date(2016, 10, 2)),
-        2017: (date(2017, 4, 2), date(2017, 10, 1)), 
-        2018: (date(2018, 3, 29), date(2018, 9, 30)),
-        2019: (date(2019, 3, 20), date(2019, 9, 29)),
-        2020: (date(2020, 7, 23), date(2020, 9, 27)),  # COVID shortened season
         2021: (date(2021, 4, 1), date(2021, 10, 3)),
         2022: (date(2022, 4, 7), date(2022, 10, 5)),
         2023: (date(2023, 3, 30), date(2023, 10, 1)),
