@@ -1,0 +1,144 @@
+{
+    "Comment": "MLB Data Pipeline - 10 Year Historical Backfill",
+    "StartAt": "InitializePipeline",
+    "States": {
+      "InitializePipeline": {
+        "Type": "Pass",
+        "Result": {
+          "years": [2021, 2022, 2023, 2024, 2025]
+        },
+        "Next": "ProcessYears"
+      },
+      
+      "ProcessYears": {
+        "Type": "Map",
+        "ItemsPath": "$.years",
+        "MaxConcurrency": 2,
+        "Iterator": {
+          "StartAt": "ProcessSingleYear",
+          "States": {
+            "ProcessSingleYear": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "FetchRawData",
+                  "States": {
+                    "FetchRawData": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "mlb-data-pipeline",
+                        "Payload": {
+                          "mode": "historical_raw",
+                          "year.$": "$"
+                        }
+                      },
+                      "Retry": [
+                        {
+                          "ErrorEquals": ["States.TaskFailed"],
+                          "IntervalSeconds": 30,
+                          "MaxAttempts": 3,
+                          "BackoffRate": 2.0
+                        }
+                      ],
+                      "Catch": [
+                        {
+                          "ErrorEquals": ["States.ALL"],
+                          "Next": "RawDataFailed"
+                        }
+                      ],
+                      "End": true
+                    },
+                    "RawDataFailed": {
+                      "Type": "Pass",
+                      "Result": {
+                        "status": "failed",
+                        "step": "raw_data"
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "CheckRawDataSuccess"
+            },
+            
+            "CheckRawDataSuccess": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$[0].statusCode",
+                  "NumericLessThan": 300,
+                  "Next": "ProcessAggregations"
+                }
+              ],
+              "Default": "YearProcessingFailed"
+            },
+            
+            "ProcessAggregations": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "mlb-data-pipeline",
+                "Payload": {
+                  "mode": "historical_agg",
+                  "year.$": "$"
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 15,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "AggregationFailed"
+                }
+              ],
+              "Next": "YearProcessingComplete"
+            },
+            
+            "AggregationFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "failed",
+                "step": "aggregations"
+              },
+              "End": true
+            },
+            
+            "YearProcessingComplete": {
+              "Type": "Pass",
+              "Result": {
+                "status": "success"
+              },
+              "End": true
+            },
+            
+            "YearProcessingFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "failed",
+                "step": "raw_data"
+              },
+              "End": true
+            }
+          }
+        },
+        "Next": "PipelineComplete"
+      },
+      
+      "PipelineComplete": {
+        "Type": "Pass",
+        "Result": {
+          "message": "10-year historical backfill completed",
+          "timestamp.$": "$$.State.EnteredTime"
+        },
+        "End": true
+      }
+    }
+  }
