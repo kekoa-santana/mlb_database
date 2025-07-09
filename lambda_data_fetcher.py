@@ -13,7 +13,7 @@ from lambda_utils import (
     logger
 )
 
-from data_fetchers.boxscore_api_fetch import run_for_date
+from data_fetchers.boxscore_api_fetch import run_for_date, fetch_and_parse, parse_boxscore, API_BASE, LEAGUE_ID 
 
 # Enable pybaseball cache for efficiency
 try:
@@ -23,7 +23,7 @@ except Exception as e:
     logger.warning(f"Could not enable pybaseball cache: {e}")
 
 class LambdaDataFetcher:
-    """Adapted data fetcher for Lambda/RDS environment"""
+    # Adapted data fetcher for Lambda/RDS environment
     
     def __init__(self):
         self.failed_dates = []
@@ -31,7 +31,7 @@ class LambdaDataFetcher:
         self.retry_delay = 5
         
     def fetch_with_retries(self, fetch_function, *args, **kwargs):
-        """Wrapper for pybaseball calls with retries"""
+        # Wrapper for pybaseball calls with retries
         for attempt in range(self.max_retries):
             try:
                 time.sleep(1)  # Rate limiting
@@ -51,7 +51,7 @@ class LambdaDataFetcher:
         return None
 
     def fetch_statcast_pitchers_for_period(self, start_date: date, end_date: date) -> bool:
-        """Fetch pitcher statcast data for a date range"""
+        # Fetch pitcher statcast data for a date range
         logger.info(f"Fetching pitcher data: {start_date} to {end_date}")
         
         try:
@@ -86,7 +86,7 @@ class LambdaDataFetcher:
             return False
 
     def fetch_statcast_batters_for_period(self, start_date: date, end_date: date) -> bool:
-        """Fetch batter statcast data for a date range"""
+        # Fetch batter statcast data for a date range
         logger.info(f"Fetching batter data: {start_date} to {end_date}")
         
         try:
@@ -120,102 +120,39 @@ class LambdaDataFetcher:
             self.failed_dates.append(f"batter_{start_date}_{end_date}")
             return False
 
-    def parse_boxscore(raw: Dict) -> pd.DataFrame:
-        """
-        Turn a boxscore JSON into a flat DataFrame with both batting,
-        pitching, linescore, and game‐meta fields.
-        """
-        rows = []
-
-        # Game‐level meta
-        game = raw.get("gameData", {}).get("game", {})
-        venue = raw.get("gameData", {}).get("venue", {})
-        datetime_meta = raw.get("gameData", {}).get("datetime", {})
-        linescore = raw.get("liveData", {}).get("linescore", {})
-        box = raw.get("liveData", {}).get("boxscore", {})
-        info = box.get("info", {})
-
-        for side in ("home", "away"):
-            team_meta = raw["gameData"]["teams"][side]
-            stats = box.get("teams", {}).get(side, {}).get("teamStats", {})
-            bat = stats.get("batting", {})
-            pit = stats.get("pitching", {})
-
-            row = {
-                # identifiers
-                "game_pk":            game.get("pk"),
-                "date":               datetime_meta.get("officialDate"),
-                "team_id":            team_meta.get("id"),
-                "team_name":          team_meta.get("name"),
-
-                # batting
-                "runs":               bat.get("runs"),
-                "hits":               bat.get("hits"),
-                "errors":             bat.get("errors"),
-                "left_on_base":       bat.get("leftOnBase"),
-                "at_bats":            bat.get("atBats"),
-                "doubles":            bat.get("doubles"),
-                "triples":            bat.get("triples"),
-                "home_runs":          bat.get("homeRuns"),
-                "rbi":                bat.get("rbi"),
-                "walks":              bat.get("baseOnBalls"),
-                "hit_by_pitch":       bat.get("hitByPitch"),
-                "strikeouts":         bat.get("strikeOuts"),
-                "stolen_bases":       bat.get("stolenBases"),
-                "caught_stealing":    bat.get("caughtStealing"),
-                "grounded_into_dp":   bat.get("groundIntoDoublePlays"),
-
-                # pitching
-                "innings_pitched":      pit.get("inningsPitched"),
-                "earned_runs_allowed":  pit.get("earnedRuns"),
-                "hits_allowed":         pit.get("hits"),
-                "hr_allowed":           pit.get("homeRuns"),
-                "walks_allowed":        pit.get("baseOnBalls"),
-                "strikeouts_pitched":   pit.get("strikeOuts"),
-
-                # linescore & context
-                "total_innings":      linescore.get("inningsPlayed"),
-                "weather":            linescore.get("weather"),
-                "attendance":         info.get("attendance"),
-                "duration_ms":        linescore.get("gameDurationMillis"),
-
-                # game meta
-                "game_type":          game.get("type"),       # "R" regular, "P" playoff
-                "day_night":          game.get("dayNight"),
-                "venue_id":           venue.get("id"),
-                "venue_name":         venue.get("name"),
-            }
-
-            rows.append(row)
-
-        return pd.DataFrame(rows)
-
     def fetch_mlb_boxscores_for_period(self, start_date: date, end_date: date) -> bool:
-        """Fetch MLB boxscore data using the existing scraper logic"""
-        logger.info(f"Fetching boxscores: {start_date} to {end_date}")
-        
-        try:
-            # We'll need to adapt the boxscore scraper from the codebase
-            # For now, let's use a simplified version
-            boxscores = self._fetch_boxscores_simple(start_date, end_date)
-            
-            if boxscores.empty:
-                logger.warning(f"No boxscores found for {start_date} to {end_date}")
-                return True
-                
-            success = store_dataframe_to_rds(boxscores, 'mlb_boxscores', if_exists='append')
-            if not success:
-                self.failed_dates.append(f"boxscores_{start_date}_{end_date}")
-                
-            return success
-            
-        except Exception as e:
-            logger.error(f"Error fetching boxscores for {start_date}-{end_date}: {e}")
-            self.failed_dates.append(f"boxscores_{start_date}_{end_date}")
-            return False
+        #Fetch and parse boxscores for a date range using the StatsAPI.
+        all_dfs: List[pd.DataFrame] = []
+
+        current = start_date
+        while current <= end_date:
+            date_str = current.strftime("%Y-%m-%d")
+            try:
+                sched_url = f"{API_BASE}/schedule?sportId={LEAGUE_ID}&date={date_str}"
+                resp = requests.get(sched_url, timeout=10)
+                resp.raise_for_status()
+                schedule = resp.json()
+                game_pks = [g["gamePk"] for d in schedule.get("dates", []) for g in d.get("games", [])]
+
+                for pk in game_pks:
+                    try:
+                        box_url = f"{API_BASE}/{pk}/boxscore"
+                        r = requests.get(box_url, timeout=10)
+                        r.raise_for_status()
+                        df = parse_boxscore(r.json())
+                        if not df.empty:
+                            all_dfs.append(df)
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch/parse boxscore {pk}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch schedule for {date_str}: {e}")
+
+            current += timedelta(days=1)
+
+        return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
 
     def _clean_statcast_data(self, df: pd.DataFrame, perspective: str) -> pd.DataFrame:
-        """Clean and standardize statcast data"""
+        # Clean and standardize statcast data
         if df.empty:
             return df
             
@@ -301,16 +238,23 @@ class LambdaDataFetcher:
         return df
 
     def _fetch_boxscores_simple(self, start_date: date, end_date: date) -> pd.DataFrame:
-        """Simplified boxscore fetcher - adapt the existing scraper here"""
-        # This is a placeholder - you'd adapt the existing boxscore scraper
-        # from src/scripts/scrape_mlb_boxscores.py to work here
-        
-        # For now, return empty DataFrame
-        logger.warning("Boxscore fetching not yet implemented")
-        return pd.DataFrame()
+        # Simplified async boxscore fetcher using the API helpers.
+
+        dfs: List[pd.DataFrame] = []
+        current = start_date
+
+        while current <= end_date:
+            date_str = current.strftime("%Y-%m-%d")
+            df = asyncio.run(fetch_and_parse(date_str))
+            if not df.empty:
+                df["scraped_timestamp"] = datetime.utcnow()
+                dfs.append(df)
+            current += timedelta(days=1)
+
+        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
     def aggregate_starting_pitchers_for_period(self, start_date: date, end_date: date) -> bool:
-        """Create game-level starting pitcher stats"""
+        # Create game-level starting pitcher stats
         logger.info(f"Aggregating starting pitchers: {start_date} to {end_date}")
         
         try:
@@ -344,7 +288,7 @@ class LambdaDataFetcher:
             return False
 
     def _aggregate_pitcher_stats(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Aggregate pitch-level data to game-level stats"""
+        # Aggregate pitch-level data to game-level stats
         # This adapts the logic from create_starting_pitcher_table.py
         
         # Filter for starting pitchers (first inning, substantial pitch count)
@@ -366,6 +310,14 @@ class LambdaDataFetcher:
         
         # Merge back to get only starter data
         starter_data = df.merge(starter_games, on=['game_pk', 'pitcher'])
+
+        # Per-pitch flags for strike type metrics
+        starter_data['swing_miss'] = starter_data['description'].isin(
+            ['swinging_strike', 'swinging_strike_blocked']
+        )
+        starter_data['first_strike'] = (
+            (starter_data['pitch_number'] == 1) & (starter_data['type'] == 'S')
+        )
         
         # Aggregate to game level
         agg_dict = {
@@ -390,6 +342,21 @@ class LambdaDataFetcher:
         )
         
         result = starter_data.groupby(['game_pk', 'pitcher']).agg(agg_dict).reset_index()
+
+        # Calculate rate metrics separately
+        rate_df = (
+            starter_data
+            .groupby(['game_pk', 'pitcher'])[['swing_miss', 'first_strike']]
+            .mean()
+            .reset_index()
+            .rename(columns={
+                'swing_miss': 'swinging_strike_rate',
+                'first_strike': 'first_pitch_strike_rate'
+            })
+        )
+
+        # Merge rates before renaming columns
+        result = result.merge(rate_df, on=['game_pk', 'pitcher'], how='left')
         
         # Rename columns to match schema
         result = result.rename(columns={
@@ -399,14 +366,14 @@ class LambdaDataFetcher:
             'events': 'strikeouts'
         })
         
-        # Add calculated rates
-        result['swinging_strike_rate'] = 0.0  # Placeholder - calculate from description
-        result['first_pitch_strike_rate'] = 0.0  # Placeholder
+        result[['swinging_strike_rate', 'first_pitch_strike_rate']] = result[
+            ['swinging_strike_rate', 'first_pitch_strike_rate']
+        ].fillna(0.0)
         
         return result
 
     def fetch_year_data(self, year: int) -> Dict[str, bool]:
-        """Fetch all data for a specific year"""
+        # Fetch all data for a specific year
         logger.info(f"Starting data fetch for year {year}")
         
         date_ranges = get_season_date_ranges()
@@ -439,7 +406,7 @@ class LambdaDataFetcher:
         }
 
     def aggregate_year_data(self, year: int) -> Dict[str, bool]:
-        """Run aggregations for a specific year"""
+        # Run aggregations for a specific year
         logger.info(f"Starting aggregations for year {year}")
         
         date_ranges = get_season_date_ranges()

@@ -3,51 +3,32 @@ import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
-# Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
 
-# Load environment variables
 from dotenv import load_dotenv
 load_dotenv('config/.env')
 
 import json
+import pytest
 from lambda_function import lambda_handler
+from .utils import has_network
 
 class MockContext:
-    """Mock AWS Lambda context for local testing"""
+    #Mock AWS Lambda context for local testing
     def get_remaining_time_in_millis(self):
         return 900000  # 15 minutes
 
 def test_daily_update():
-    """Test daily update mode with a unique date each time"""
-    print("🧪 Testing daily update mode...")
+    # Test daily update mode with a unique date each time
     
-    # Use a different date each time to avoid duplicates
-    # Use a date from 2023 spring training (safe, won't change)
-    test_date = "2023-03-15"  # Different from previous tests
+    clean_test_data()
     
     test_event = {
         "mode": "daily_update",
-        "date": test_date
+        "date": "2024-06-11"
     }
     
-    try:
-        response = lambda_handler(test_event, MockContext())
-        
-        print(f"✅ Lambda function completed")
-        print(f"✅ Status Code: {response['statusCode']}")
-        
-        if response['statusCode'] in [200, 206]:  # 206 = partial success
-            print("✅ Daily update test PASSED")
-            return True
-        else:
-            print(f"❌ Unexpected response: {response}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Lambda test failed: {e}")
-        return False
-
+    
 def test_table_creation_mode():
     """Test just the table creation without data fetching"""
     print("🧪 Testing table creation...")

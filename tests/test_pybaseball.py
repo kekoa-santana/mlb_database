@@ -1,17 +1,18 @@
 import sys
-import os
+import datetime
 
 # Add the parent directory to Python path so we can import our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import pybaseball as pb
-import pandas as pd
-from datetime import date
-from dotenv import load_dotenv
-load_dotenv('config/.env')
+import pytest
+from .utils import has_network
+
+pb = pytest.importorskip("pybaseball")
+
+@pytest.mark.skipif(not has_network(), reason="Network required")
 
 def test_pybaseball_connection():
-    """Test if pybaseball can fetch data successfully"""
+    # Test if pybaseball can fetch data successfully"""
     try:
         print("Testing pybaseball connection...")
         
