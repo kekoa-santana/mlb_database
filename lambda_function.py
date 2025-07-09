@@ -38,6 +38,9 @@ def lambda_handler(event, context):
         
         if mode == 'historical_raw':
             return handle_historical_raw(fetcher, year, context)
+
+        elif mode == "boxscores_raw":
+            return fetcher._fetch_boxscores_simple(event["date"])
             
         elif mode == 'historical_agg':
             return handle_historical_aggregations(fetcher, year, context)

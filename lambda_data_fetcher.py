@@ -13,6 +13,8 @@ from lambda_utils import (
     logger
 )
 
+from data_fetchers.boxscore_api_fetch import run_for_date
+
 # Enable pybaseball cache for efficiency
 try:
     pb.cache.enable()
@@ -117,6 +119,76 @@ class LambdaDataFetcher:
             logger.error(f"Error fetching batter data for {start_date}-{end_date}: {e}")
             self.failed_dates.append(f"batter_{start_date}_{end_date}")
             return False
+
+    def parse_boxscore(raw: Dict) -> pd.DataFrame:
+        """
+        Turn a boxscore JSON into a flat DataFrame with both batting,
+        pitching, linescore, and game‐meta fields.
+        """
+        rows = []
+
+        # Game‐level meta
+        game = raw.get("gameData", {}).get("game", {})
+        venue = raw.get("gameData", {}).get("venue", {})
+        datetime_meta = raw.get("gameData", {}).get("datetime", {})
+        linescore = raw.get("liveData", {}).get("linescore", {})
+        box = raw.get("liveData", {}).get("boxscore", {})
+        info = box.get("info", {})
+
+        for side in ("home", "away"):
+            team_meta = raw["gameData"]["teams"][side]
+            stats = box.get("teams", {}).get(side, {}).get("teamStats", {})
+            bat = stats.get("batting", {})
+            pit = stats.get("pitching", {})
+
+            row = {
+                # identifiers
+                "game_pk":            game.get("pk"),
+                "date":               datetime_meta.get("officialDate"),
+                "team_id":            team_meta.get("id"),
+                "team_name":          team_meta.get("name"),
+
+                # batting
+                "runs":               bat.get("runs"),
+                "hits":               bat.get("hits"),
+                "errors":             bat.get("errors"),
+                "left_on_base":       bat.get("leftOnBase"),
+                "at_bats":            bat.get("atBats"),
+                "doubles":            bat.get("doubles"),
+                "triples":            bat.get("triples"),
+                "home_runs":          bat.get("homeRuns"),
+                "rbi":                bat.get("rbi"),
+                "walks":              bat.get("baseOnBalls"),
+                "hit_by_pitch":       bat.get("hitByPitch"),
+                "strikeouts":         bat.get("strikeOuts"),
+                "stolen_bases":       bat.get("stolenBases"),
+                "caught_stealing":    bat.get("caughtStealing"),
+                "grounded_into_dp":   bat.get("groundIntoDoublePlays"),
+
+                # pitching
+                "innings_pitched":      pit.get("inningsPitched"),
+                "earned_runs_allowed":  pit.get("earnedRuns"),
+                "hits_allowed":         pit.get("hits"),
+                "hr_allowed":           pit.get("homeRuns"),
+                "walks_allowed":        pit.get("baseOnBalls"),
+                "strikeouts_pitched":   pit.get("strikeOuts"),
+
+                # linescore & context
+                "total_innings":      linescore.get("inningsPlayed"),
+                "weather":            linescore.get("weather"),
+                "attendance":         info.get("attendance"),
+                "duration_ms":        linescore.get("gameDurationMillis"),
+
+                # game meta
+                "game_type":          game.get("type"),       # "R" regular, "P" playoff
+                "day_night":          game.get("dayNight"),
+                "venue_id":           venue.get("id"),
+                "venue_name":         venue.get("name"),
+            }
+
+            rows.append(row)
+
+        return pd.DataFrame(rows)
 
     def fetch_mlb_boxscores_for_period(self, start_date: date, end_date: date) -> bool:
         """Fetch MLB boxscore data using the existing scraper logic"""
