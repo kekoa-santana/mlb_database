@@ -11,7 +11,7 @@ load_dotenv('config/.env')
 import json
 import pytest
 from lambda_function import lambda_handler
-from .utils import has_network
+from .test_utils import has_network
 
 class MockContext:
     #Mock AWS Lambda context for local testing

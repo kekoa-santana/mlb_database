@@ -1,6 +1,7 @@
 import pandas as pd
 import pybaseball as pb
 import numpy as np
+import asyncio
 from datetime import datetime, date, timedelta
 import logging
 from typing import List, Dict, Tuple, Optional
@@ -150,6 +151,66 @@ class LambdaDataFetcher:
             current += timedelta(days=1)
 
         return pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+
+    def fetch_team_season_batting(self, season: int) -> bool:
+        # Fetch season-long team batting statistics via pybaseball and store.
+        logger.info(f"Fetching team batting stats for {season}")
+
+        df = self.fetch_with_retries(pb.team_batting, season)
+        if df is None or df.empty:
+            logger.warning(f"No team batting data for {season}")
+        df['season'] = season
+        df['scraped_timestamp'] = datetime.utcnow()
+
+        return store_dataframe_to_rds(df, 'season_team_batting', if_exists='replace')
+
+    def fetch_probable_pitchers_and_lineups(self, target_date: date) -> bool:
+        # Hit MLB Stats API with hydrate to pull probable pitchers and lineups
+        date_str = target_date.strftime("%Y-%m-%d")
+        logger.info(f"Fetching probable pitchers/lineups for {date_str}")
+
+        try:
+            # hydrate both probablePitcher and teamInfo(lineup) if supported
+            url = (
+                f"{API_BASE}/schedule"
+                f"?sportId={LEAGUE_ID}"
+                f"&date={date_str}"
+                f"&hydrate=probablePitcher,teamInfo(lineup)"
+            )
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            sched = resp.json().get('dates', [])
+            rows = []
+            for day in sched:
+                for game in day.get('games', []):
+                    pk = game['gamePk']
+                    # teams block
+                    home = game['teams']['home']
+                    away = game['teams']['away']
+                    for side in ('home', 'away'):
+                        t = game['teams'][side]
+                        team_abbr = t['team']['abbreviation']
+                        prob = t.get('probablePitcher') or {}
+                        lineup = t.get('lineup', {}).get('batters', [])
+                        rows.append({
+                            'game_pk': pk,
+                            'game_date': date_str,
+                            'team': team_abbr,
+                            'home_probable_pitcher_id': home.get('probablePitcher', {}).get('id'),
+                            'home_probable_pitcher_name': home.get('probablePitcher', {}).get('fullName'),
+                            'away_probable_pitcher_id': away.get('probablePitcher', {}).get('id'),
+                            'away_probable_pitcher_name': away.get('probablePitcher', {}).get('fullName'),
+                            'projected_lineup': lineup,  # a list of batter IDs
+                            'scraped_timestamp': datetime.utcnow()
+                        })
+            df = pd.DataFrame(rows)
+            if df.empty:
+                logger.info("No probable‐pitcher/lineup data returned")
+                return True
+            return store_dataframe_to_rds(df, 'probable_lineup', if_exists='append')
+        except Exception as e:
+            logger.error(f"Error in fetch_probable_pitchers_and_lineups: {e}")
+            return False
 
     def _clean_statcast_data(self, df: pd.DataFrame, perspective: str) -> pd.DataFrame:
         # Clean and standardize statcast data
@@ -381,12 +442,13 @@ class LambdaDataFetcher:
             logger.error(f"No date range defined for year {year}")
             return {'success': False}
             
-        start_date, end_date = date_ranges[year]
-        
-        # Break into monthly chunks to avoid timeouts
+        # pull the full-season team batting table
         results = {}
+        results['team_batting'] = self.fetch_team_season_batting(year)
+        # Break into monthly chunks to avoid timeouts
+
+        start_date, end_date = date_ranges[year]
         current_date = start_date
-        
         while current_date <= end_date:
             chunk_end = min(current_date + timedelta(days=30), end_date)
             

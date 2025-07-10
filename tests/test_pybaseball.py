@@ -1,18 +1,19 @@
 import sys
 import datetime
+import os
 
 # Add the parent directory to Python path so we can import our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from .utils import has_network
+from .test_utils import has_network
 
 pb = pytest.importorskip("pybaseball")
 
 @pytest.mark.skipif(not has_network(), reason="Network required")
 
 def test_pybaseball_connection():
-    # Test if pybaseball can fetch data successfully"""
+    # Test if pybaseball can fetch data successfully
     try:
         print("Testing pybaseball connection...")
         

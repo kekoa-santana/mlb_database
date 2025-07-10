@@ -40,7 +40,16 @@ def lambda_handler(event, context):
             return handle_historical_raw(fetcher, year, context)
 
         elif mode == "boxscores_raw":
-            return fetcher._fetch_boxscores_simple(event["date"])
+            # Parse the YYYY-MM-DD string into a date object
+            target = datetime.strptime(event["date"], "%Y-%m-%d").date()
+            # Fetch boxscores for that one day
+            df = fetcher._fetch_boxscores_simple(target, target)
+            # Return JSON-serializable output
+            return lambda_response(
+                200,
+                f"Fetched boxscores for {event['date']}",
+                df.to_dict(orient="records")
+            )
             
         elif mode == 'historical_agg':
             return handle_historical_aggregations(fetcher, year, context)
@@ -56,7 +65,7 @@ def lambda_handler(event, context):
         return lambda_response(500, f"Internal error: {str(e)}")
 
 def handle_historical_raw(fetcher: LambdaDataFetcher, year: int, context) -> dict:
-    """Handle historical raw data fetching for a specific year"""
+    # Handle historical raw data fetching for a specific year
     
     if not year:
         return lambda_response(400, "Year parameter required for historical_raw mode")
@@ -83,7 +92,7 @@ def handle_historical_raw(fetcher: LambdaDataFetcher, year: int, context) -> dic
         return lambda_response(206, message, results)  # 206 = Partial Content
 
 def handle_historical_aggregations(fetcher: LambdaDataFetcher, year: int, context) -> dict:
-    """Handle historical aggregations for a specific year"""
+    # Handle historical aggregations for a specific year
     
     if not year:
         return lambda_response(400, "Year parameter required for historical_agg mode")
@@ -103,7 +112,7 @@ def handle_historical_aggregations(fetcher: LambdaDataFetcher, year: int, contex
         return lambda_response(206, message, results)
 
 def handle_daily_update(fetcher: LambdaDataFetcher, target_date: str, context) -> dict:
-    """Handle daily data updates"""
+    # Handle daily data updates
     
     # Use yesterday if no date provided
     if not target_date:
@@ -139,13 +148,17 @@ def handle_daily_update(fetcher: LambdaDataFetcher, target_date: str, context) -
     
     # Run quick aggregations for the day
     results['agg_pitchers'] = fetcher.aggregate_starting_pitchers_for_period(target_date_obj, target_date_obj)
+
+    # seasonal team batting stats (replace table so it's always current)
+    season = target_date_obj.year
+    results['team_batting'] = fetcher.fetch_team_season_batting(season)
     
     # Fetch probable lineups for next day (if in season)
     next_day = target_date_obj + timedelta(days=1)
     if year in season_dates:
         start_season, end_season = season_dates[year]
         if start_season <= next_day <= end_season:
-            results['probable_lineups'] = fetch_probable_lineups(next_day)
+            results['probable_lineups'] = fetcher.fetch_probable_pitchers_and_lineups(next_day)
         else:
             results['probable_lineups'] = True  # No probables needed outside season
     
@@ -169,7 +182,7 @@ def handle_daily_update(fetcher: LambdaDataFetcher, target_date: str, context) -
         })
 
 def fetch_probable_lineups(target_date: date) -> bool:
-    """Fetch probable lineups/pitchers for the target date"""
+    # Fetch probable lineups/pitchers for the target date
     try:
         from lambda_utils import store_dataframe_to_rds
         
