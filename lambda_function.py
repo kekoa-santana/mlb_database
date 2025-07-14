@@ -1,10 +1,20 @@
-import json
+import os
+# Force any "Home"-based caches into the Lambda-writeable /tmp directory
+os.environ['HOME'] = '/tmp'
+
+import pybaseball as pb
+try:
+    pb.cache.disable()
+except Exception:
+    pass
+
 import pandas as pd
-import logging
+import requests
 from datetime import datetime, date, timedelta
 from lambda_utils import (
     create_database_tables, 
-    lambda_response, 
+    lambda_response,
+    RDSConnection,
     get_season_date_ranges,
     logger
 )
@@ -56,10 +66,22 @@ def lambda_handler(event, context):
             
         elif mode == 'daily_update':
             return handle_daily_update(fetcher, target_date, context)
-            
+
+        elif mode == "historical_chunk":
+            return handle_historical_chunk(fetcher,
+                                       event["start_date"],
+                                       event["end_date"])
+
+        elif mode == "refresh_lineups_only":
+            return handle_refresh_lineups_only(fetcher,
+                                            event["date"])
+
+        elif mode == "health_check":
+            return handle_health_check()
+        
         else:
             return lambda_response(400, f"Unknown mode: {mode}")
-            
+                
     except Exception as e:
         logger.error(f"Lambda execution failed: {e}", exc_info=True)
         return lambda_response(500, f"Internal error: {str(e)}")
@@ -181,29 +203,53 @@ def handle_daily_update(fetcher: LambdaDataFetcher, target_date: str, context) -
             'failed_dates': fetcher.failed_dates
         })
 
-def fetch_probable_lineups(target_date: date) -> bool:
-    # Fetch probable lineups/pitchers for the target date
-    try:
-        from lambda_utils import store_dataframe_to_rds
-        
-        # This would use the MLB API logic from the codebase
-        # Adapting from src/data/mlb_api.py
-        
-        logger.info(f"Fetching probable lineups for {target_date}")
-        
-        # Placeholder - you'd implement the actual API call here
-        # using the logic from scrape_probable_pitchers()
-        
-        probable_data = []  # This would be populated from API
-        
-        if probable_data:
-            df = pd.DataFrame(probable_data)
-            df['scraped_timestamp'] = datetime.utcnow()
-            return store_dataframe_to_rds(df, 'probable_lineup', if_exists='append')
-        else:
-            logger.info(f"No probable lineups found for {target_date}")
-            return True
-            
+def handle_historical_chunk(fetcher: LambdaDataFetcher, start_str: str, end_str: str) -> dict:
+    # Backfill raw data just between start_date and end_date inclusively.
+    start = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end = datetime.strptime(end_str, "%Y-%m-%d").date()
+
+    # Raw fetches
+    pitchers = fetcher.fetch_statcast_pitchers_for_period(start, end)
+    batters = fetcher.fetch_statcast_batters_for_period(start, end)
+    boxscores = fetcher.fetch_mlb_boxscores_for_period(start, end)
+
+    team_stats = fetcher.fetch_team_season_batting(start.year)
+    return {
+        "pitchers": pitchers,
+        "batters": batters,
+        "boxscores": boxscores,
+        "team_batting": team_stats,
+    }
+
+def handle_health_check() -> dict:
+    # Very light check: can we talk to the DB and can we hit an MLB endpoint
+    
+    # RDS connectivity
+    try: 
+        conn = RDSConnection.get_connection()
+        conn.close()
+        db_ok=True
     except Exception as e:
-        logger.error(f"Error fetching probable lineups: {e}")
-        return False
+        db_ok = False
+    
+    # MLB API ping
+    try:
+        r = requests.get("https://statsapi.mlb.com/api/v1/schedule?sportId=1&gamePk=1", timeout=5)
+        api_ok = r.status_code == 200
+    except:
+        api_ok = False
+
+    status = {
+        "db_connection": db_ok,
+        "mlb_api": api_ok
+    }
+    code = 200 if all(status.values()) else 500
+    return lambda_response(code, "health_check", status)
+
+def handle_refresh_lineups_only(fetcher: LambdaDataFetcher, date_str: str) -> dict:
+    # Re-run only the probable-pitcher + lineup fetch for the given date
+    target = datetime.strptime(date_str, "%Y-%m-%d").date()
+    ok = fetcher.fetch_probable_pitchers_and_lineups(target)
+    return lambda_response(200 if ok else 500,
+                            "refresh_lineups_only",
+                            {"lineups_refreshed": ok})

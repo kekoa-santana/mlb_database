@@ -3,6 +3,7 @@ __pycache__/
 .venv
 *.sqlite
 *.db
+event.json
 layer/
 lambda-layer/
 infra/
