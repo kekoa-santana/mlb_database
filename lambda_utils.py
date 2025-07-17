@@ -1,11 +1,10 @@
 import os
 import logging
+from contextlib import contextmanager
 import psycopg2
 import pandas as pd
-from contextlib import contextmanager
-from typing import Optional, Dict, Any
 import json
-from datetime import datetime, timedelta, date
+from datetime import datetime
 from sqlalchemy import create_engine
 from sqlalchemy.pool import NullPool
 
@@ -14,107 +13,114 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 class RDSConnection:
-    """PostgreSQL RDS connection manager for Lambda"""
-    
+    """Context manager for PostgreSQL RDS connections in Lambda."""
     def __init__(self):
         self.host = os.environ['RDS_HOST']
-        self.database = os.environ['RDS_DATABASE'] 
+        self.database = os.environ['RDS_DATABASE']
         self.username = os.environ['RDS_USERNAME']
         self.password = os.environ['RDS_PASSWORD']
         self.port = os.environ.get('RDS_PORT', '5432')
-        
-    @contextmanager
-    def get_connection(self):
-        """Context manager for PostgreSQL connections"""
-        conn = None
-        try:
-            conn = psycopg2.connect(
-                host=self.host,
-                database=self.database,
-                user=self.username,
-                password=self.password,
-                port=self.port,
-                connect_timeout=30
-            )
-            yield conn
-        except Exception as e:
-            logger.error(f"Database connection error: {e}")
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                conn.close()
-                
-    def get_sqlalchemy_engine(self):
-        """Get SQLAlchemy engine for pandas operations"""
-        connection_string = f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
-        return create_engine(connection_string, poolclass=NullPool)
 
-def store_dataframe_to_rds(df: pd.DataFrame, table_name: str, if_exists: str = 'append') -> bool:
-    """Store DataFrame to RDS PostgreSQL with proper error handling"""
+    def __enter__(self):
+        logger.info(f"⏳ Opening DB connection to {self.host}:{self.port}/{self.database} as {self.username}")
+        self.conn = psycopg2.connect(
+            host=self.host,
+            dbname=self.database,
+            user=self.username,
+            password=self.password,
+            port=self.port,
+            connect_timeout=30
+        )
+        logger.info("✅ DB connection established")
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type:
+            logger.error(f"Error during DB operation: {exc_val}")
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+        logger.info("✖ Closing DB connection")
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def get_sqlalchemy_engine(self):
+        """Create a SQLAlchemy engine for writes."""
+        uri = f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
+        return create_engine(uri, poolclass=NullPool)
+
+
+def store_dataframe_to_rds(df: pd.DataFrame,
+                          table_name: str,
+                          if_exists: str = 'append',
+                          date_col: str = 'game_date') -> bool:
+    """Store DataFrame to RDS, skipping rows already present via pre-filtering."""
     if df.empty:
         logger.info(f"Empty DataFrame for {table_name}, skipping")
         return True
-        
-    rds = RDSConnection()
-    try:
-        engine = rds.get_sqlalchemy_engine()
-        
-        # Calculate dynamic chunksize
-        num_columns = len(df.columns)
-        SQLITE_MAX_VARS = 30000
-        pandas_chunksize = max(1, min(SQLITE_MAX_VARS // num_columns, 1000))
-        
-        logger.info(f"Storing {len(df)} records to {table_name} (chunksize: {pandas_chunksize})")
-        
-        # For testing: check if we need to handle duplicates
-        if if_exists == 'append':
-            # Use ON CONFLICT DO NOTHING for PostgreSQL to handle duplicates gracefully
-            df.to_sql(
-                name=table_name,
-                con=engine,
-                if_exists=if_exists,
-                index=False,
-                chunksize=pandas_chunksize,
-                method='multi'
-            )
-        else:
-            df.to_sql(
-                name=table_name,
-                con=engine,
-                if_exists=if_exists,
-                index=False,
-                chunksize=pandas_chunksize,
-                method='multi'
-            )
-        
-        logger.info(f"Successfully stored {len(df)} rows to {table_name}")
-        return True
-        
-    except Exception as e:
-        error_str = str(e)
-        if "duplicate key value violates unique constraint" in error_str:
-            logger.warning(f"Duplicate data detected for {table_name} - this is normal for testing")
-            logger.warning("In production, use proper date filtering to avoid duplicates")
-            return True  # Consider duplicates as success for testing
-        else:
-            logger.error(f"Failed to store data to {table_name}: {e}")
-            return False
 
-def get_season_date_ranges() -> Dict[int, tuple]:
-    """Return optimized date ranges for each MLB season (regular season only)"""
+    # Primary key columns per table
+    pk_map = {
+        'statcast_pitchers':       ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
+        'statcast_batters':        ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
+        'mlb_boxscores':           ['game_pk'],
+        'season_team_batting':     ['game_pk'],
+        # add others as necessary
+    }
+    pk_cols = pk_map.get(table_name)
+
+    rds = RDSConnection()
+    # Pre-filter existing rows if possible
+    if pk_cols and date_col in df.columns:
+        start = df[date_col].min().strftime('%Y-%m-%d')
+        end = df[date_col].max().strftime('%Y-%m-%d')
+        sql = f"SELECT {', '.join(pk_cols)} FROM {table_name} WHERE {date_col} BETWEEN '{start}' AND '{end}'"
+        with rds as conn:
+            existing = pd.read_sql(sql, conn)
+        merged = df.merge(existing, on=pk_cols, how='left', indicator=True)
+        new_df = merged[merged['_merge']=='left_only'].drop(columns=['_merge'] + pk_cols)
+    else:
+        new_df = df.copy()
+
+    if new_df.empty:
+        logger.info(f"No new rows for {table_name} (all duplicates or missing date_col)")
+        return True
+
+    # Write new rows
+    engine = rds.get_sqlalchemy_engine()
+    num_cols = len(new_df.columns)
+    SQLITE_MAX_VARS = 30000
+    chunksize = max(1, min(SQLITE_MAX_VARS // num_cols, 1000))
+
+    logger.info(f"Storing {len(new_df)} NEW rows to {table_name} (chunksize={chunksize})")
+    new_df.to_sql(
+        name=table_name,
+        con=engine,
+        if_exists=if_exists,
+        index=False,
+        chunksize=chunksize,
+        method='multi'
+    )
+    logger.info(f"Successfully stored {len(new_df)} rows to {table_name}")
+    return True
+
+
+def get_season_date_ranges() -> dict:
+    """Return start/end dates for MLB seasons (regular season)."""
+    from datetime import date
     return {
-        2021: (date(2021, 4, 1), date(2021, 10, 3)),
-        2022: (date(2022, 4, 7), date(2022, 10, 5)),
-        2023: (date(2023, 3, 30), date(2023, 10, 1)),
-        2024: (date(2024, 3, 28), date(2024, 9, 29)),
-        2025: (date(2025, 3, 27), date(2025, 9, 28))   # Projected dates
+        2021: (date(2021,4,1),  date(2021,10,3)),
+        2022: (date(2022,4,7),  date(2022,10,5)),
+        2023: (date(2023,3,30), date(2023,10,1)),
+        2024: (date(2024,3,28), date(2024,9,29)),
+        2025: (date(2025,3,27), date(2025,9,28))
     }
 
 def create_database_tables():
     """Create all required tables in PostgreSQL"""
-    
     table_schemas = {
         'statcast_pitchers': '''
             CREATE TABLE IF NOT EXISTS statcast_pitchers (
@@ -560,26 +566,23 @@ def create_database_tables():
             );
         '''
     }
-    
+
     rds = RDSConnection()
-    with rds.get_connection() as conn:
-        cursor = conn.cursor()
-        for table_name, schema in table_schemas.items():
+    with rds as conn:
+        cur = conn.cursor()
+        for tbl, ddl in table_schemas.items():
             try:
-                cursor.execute(schema)
-                logger.info(f"Created/verified table: {table_name}")
+                cur.execute(ddl)
+                logger.info(f"Created/verified table: {tbl}")
             except Exception as e:
-                logger.error(f"Failed to create table {table_name}: {e}")
+                logger.error(f"Failed to create table {tbl}: {e}")
                 raise
         conn.commit()
 
-def lambda_response(status_code: int, message: str, data: Dict[Any, Any] = None) -> Dict[str, Any]:
-    """Standard Lambda response format"""
+
+def lambda_response(status_code: int, message: str, data: dict=None) -> dict:
+    """Standard Lambda HTTP-style JSON response."""
     return {
         'statusCode': status_code,
-        'body': json.dumps({
-            'message': message,
-            'data': data or {},
-            'timestamp': datetime.utcnow().isoformat()
-        })
+        'body': json.dumps({'message': message, 'data': data or {}, 'timestamp': datetime.utcnow().isoformat()})
     }

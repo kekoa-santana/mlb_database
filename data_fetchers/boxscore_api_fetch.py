@@ -7,7 +7,7 @@ from lambda_utils import RDSConnection, store_dataframe_to_rds, logger
 from typing import List, Dict
 
 # —— CONFIGURATION —— #
-API_BASE = "https://statsapi.mlb.com/api/v1.1/game"
+API_BASE = "https://statsapi.mlb.com/api/v1"
 LEAGUE_ID = 103  # MLB
 MAX_CONCURRENT = 5
 RETRY_LIMIT = 3

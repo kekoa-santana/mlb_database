@@ -121,23 +121,33 @@ class LambdaDataFetcher:
             self.failed_dates.append(f"batter_{start_date}_{end_date}")
             return False
 
-    def fetch_mlb_boxscores_for_period(self, start_date: date, end_date: date) -> bool:
-        #Fetch and parse boxscores for a date range using the StatsAPI.
+    def fetch_mlb_boxscores_for_period(self, start_date: date, end_date: date) -> pd.DataFrame:
         all_dfs: List[pd.DataFrame] = []
-
         current = start_date
+
+        # Make sure your API_BASE is https://statsapi.mlb.com/api/v1
         while current <= end_date:
             date_str = current.strftime("%Y-%m-%d")
             try:
-                sched_url = f"{API_BASE}/schedule?sportId={LEAGUE_ID}&date={date_str}"
+                # ✅ Use the v1 schedule endpoint with startDate/endDate
+                sched_url = (
+                    f"{API_BASE}/schedule"
+                    f"?sportId={LEAGUE_ID}"
+                    f"&startDate={date_str}"
+                    f"&endDate={date_str}"
+                )
                 resp = requests.get(sched_url, timeout=10)
                 resp.raise_for_status()
                 schedule = resp.json()
-                game_pks = [g["gamePk"] for d in schedule.get("dates", []) for g in d.get("games", [])]
+                game_pks = [
+                    g["gamePk"]
+                    for d in schedule.get("dates", [])
+                    for g in d.get("games", [])
+                ]
 
                 for pk in game_pks:
                     try:
-                        box_url = f"{API_BASE}/{pk}/boxscore"
+                        box_url = f"{API_BASE}/games/{pk}/boxscore"
                         r = requests.get(box_url, timeout=10)
                         r.raise_for_status()
                         df = parse_boxscore(r.json())
