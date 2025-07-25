@@ -223,44 +223,58 @@ class LambdaDataFetcher:
             return False
 
     def _clean_statcast_data(self, df: pd.DataFrame, perspective: str) -> pd.DataFrame:
-        # Clean and standardize statcast data
+        """
+        Clean and standardize Statcast data for the given perspective ('pitcher' or 'batter').
+        Drops rows missing essential fields, filters to regular season, adds season, converts types,
+        removes duplicates, and filters to only allowed columns for the schema.
+        """
+        logger = logging.getLogger(__name__)
+
+        # 1. Early exit for empty DataFrame
         if df.empty:
             return df
-            
-        # Filter to regular season only
+
+        # 2. Filter to regular season only
         if 'game_type' in df.columns:
             df = df[df['game_type'] == 'R'].copy()
-            
-        # Add season column
+
+        # 3. Standardize game_date and add season
         if 'game_date' in df.columns:
             df['game_date'] = pd.to_datetime(df['game_date'])
             df['season'] = df['game_date'].dt.year
-            
-        # Convert numeric columns
-        numeric_cols = ['release_speed', 'release_spin_rate', 'launch_speed', 
-                       'launch_angle', 'woba_value', 'woba_denom']
+
+        # 4. Convert numeric columns to numbers
+        numeric_cols = [
+            'release_speed', 'release_spin_rate', 'launch_speed',
+            'launch_angle', 'woba_value', 'woba_denom'
+        ]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-        # Drop rows missing essential data
+
+        # 5. Drop rows missing essential data
         essential_cols = ['game_pk', 'pitcher', 'batter']
         if perspective == 'pitcher':
             essential_cols.append('pitch_number')
-        
-        for col in essential_cols:
-            if col in df.columns:
-                df = df.dropna(subset=[col])
-                
-        # Remove duplicates
-        if all(col in df.columns for col in ['game_pk', 'pitcher', 'batter', 'pitch_number']):
-            df = df.drop_duplicates(subset=['game_pk', 'pitcher', 'batter', 'pitch_number'])
-        
-        # Add pitcher_id for pitcher table
+        before_count = len(df)
+        df = df.dropna(subset=[c for c in essential_cols if c in df.columns])
+        dropped = before_count - len(df)
+        if dropped:
+            logger.info(f"Dropped {dropped} rows missing essential fields: {essential_cols}")
+
+        # 6. Remove duplicates
+        if perspective == 'pitcher':
+            dup_subset = ['game_pk', 'pitcher', 'batter', 'pitch_number']
+        else:
+            dup_subset = ['game_pk', 'pitcher', 'batter', 'at_bat_number']
+        if all(col in df.columns for col in dup_subset):
+            df = df.drop_duplicates(subset=dup_subset)
+
+        # 7. Add pitcher_id column if missing
         if perspective == 'pitcher' and 'pitcher_id' not in df.columns:
             df['pitcher_id'] = df['pitcher']
-            
-        # CRITICAL: Filter to only columns that exist in the database schema
+
+        # 8. Filter to allowed schema columns
         if perspective == 'pitcher':
             allowed_columns = [
                 'pitch_type', 'game_date', 'release_speed', 'release_pos_x', 'release_pos_z',
@@ -280,7 +294,7 @@ class LambdaDataFetcher:
                 'if_fielding_alignment', 'of_fielding_alignment', 'spin_axis',
                 'delta_home_win_exp', 'delta_run_exp', 'pitcher_id', 'season'
             ]
-        else:  # batter perspective
+        else:
             allowed_columns = [
                 'pitch_type', 'game_date', 'release_speed', 'release_pos_x', 'release_pos_z',
                 'player_name', 'batter', 'pitcher', 'events', 'description', 'zone',
@@ -299,13 +313,10 @@ class LambdaDataFetcher:
                 'if_fielding_alignment', 'of_fielding_alignment', 'spin_axis',
                 'delta_home_win_exp', 'delta_run_exp', 'season'
             ]
-        
-        # Keep only columns that exist in both the DataFrame and our schema
         final_columns = [col for col in allowed_columns if col in df.columns]
         df = df[final_columns].copy()
-        
         logger.info(f"Filtered DataFrame to {len(final_columns)} columns matching database schema")
-        
+
         return df
 
     def _fetch_boxscores_simple(self, start_date: date, end_date: date) -> pd.DataFrame:

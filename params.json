@@ -1,0 +1,6 @@
+{
+    "host": ["mlb-pipeline-db.cfguwseu2qrk.us-east-2.rds.amazonaws.com"],
+    "portNumber":["5432"],
+    "localPortNumber":["5433"]
+  }
+  
