@@ -22,13 +22,12 @@ COPY requirements.txt ${LAMBDA_TASK_ROOT}/
 RUN pip install --upgrade pip setuptools wheel \
 && pip install --no-cache-dir --prefer-binary -r requirements.txt
 
-# Copy your Lambda code
-COPY lambda_function.py     ${LAMBDA_TASK_ROOT}/
-COPY lambda_utils.py        ${LAMBDA_TASK_ROOT}/
-COPY lambda_data_fetcher.py ${LAMBDA_TASK_ROOT}/
-
-# Copy your new boxscore fetcher module
-COPY data_fetchers/         ${LAMBDA_TASK_ROOT}/data_fetchers/
+# Copy your code scripts
+COPY lambda_function.py    ${LAMBDA_TASK_ROOT}/
+COPY lambda_utils.py       ${LAMBDA_TASK_ROOT}/
+COPY utils/                ${LAMBDA_TASK_ROOT}/utils/
+COPY data_fetchers/        ${LAMBDA_TASK_ROOT}/data_fetchers/
+COPY aggregators/          ${LAMBDA_TASK_ROOT}/aggregators/
 
 # (Optional) Copy config if needed
 # COPY config/               ${LAMBDA_TASK_ROOT}/config/

@@ -1,202 +1,185 @@
 import os
-# Force any "Home"-based caches into the Lambda-writeable /tmp directory
-os.environ['HOME'] = '/tmp'
+from dotenv import load_dotenv
+import json
+from datetime import date, datetime, timedelta
 
-import pybaseball as pb
-try:
-    pb.cache.disable()
-except Exception:
-    pass
+env_path = os.path.join(os.path.dirname(__file__), "config", ".env")
+load_dotenv(dotenv_path=env_path)
 
-import pandas as pd
-import requests
-from datetime import datetime, date, timedelta
 from lambda_utils import (
-    create_database_tables, 
+    create_database_tables,
     lambda_response,
-    RDSConnection,
     get_season_date_ranges,
+    RDSConnection,
     logger
 )
-from lambda_data_fetcher import LambdaDataFetcher
 
-# Top-level Lambda handler
+# EXPLICIT FETCHER IMPORTS
+from data_fetchers.boxscore_fetcher import (
+    fetch_boxscores_for_range,
+    fetch_boxscores_for_date
+)
+from data_fetchers.statcast_fetcher import StatcastFetcher
+from data_fetchers.team_fetcher import TeamFetcher
+
+# EXPLICIT AGGREGATOR IMPORTS
+from aggregators.pitcher_aggregator import PitcherAggregator
+
 
 def lambda_handler(event, context):
     """
-    Main Lambda handler for MLB data pipeline
+    Modes:
+      - historical_raw   → full backfill of boxscores, statcast & team data
+      - historical_agg   → backfill of pitcher aggregations
+      - daily_update     → single-day fetch + aggregations
+      - health_check     → sanity‐check DB & MLB API
     """
+    # make /tmp writable for pybaseball cache
+    os.environ["HOME"] = "/tmp"
+
+    # parse inputs
+    mode    = event.get("mode", "daily_update")
+    sd_str  = event.get("start_date")
+    ed_str  = event.get("end_date")
+    tgt_str = event.get("target_date")
+
+    logger.info(f"Invoked mode={mode}, start={sd_str}, end={ed_str}, target={tgt_str}")
+    create_database_tables()
+
+    start_date = datetime.strptime(sd_str, "%Y-%m-%d").date()
+    end_date = datetime.strptime(ed_str, "%Y-%m-%d").date()
+
+    season_start = start_date.year
+    season_end = end_date.year
+    
+    seasons = list(range(season_start, season_end + 1))
+
     try:
-        # Parse event
-        mode        = event.get('mode', 'daily_update')
-        start_str   = event.get('start_date')
-        end_str     = event.get('end_date')
-        target_str  = event.get('target_date')
-        # Parse into date objects or None
-        start_date  = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else None
-        end_date    = datetime.strptime(end_str,   "%Y-%m-%d").date() if end_str   else None
-        target_date = datetime.strptime(target_str, "%Y-%m-%d").date() if target_str else None
-
-        logger.info(f"Lambda invoked with mode={mode!r}, start_date={start_date!r}, end_date={end_date!r}, target_date={target_date!r}")
-
-        # Ensure database tables exist
-        create_database_tables()
-
-        # Initialize data fetcher
-        fetcher = LambdaDataFetcher()
-
-        if mode == 'historical_raw':
-            if not start_date or not end_date:
+        # ─────────────── HISTORICAL RAW ───────────────
+        if mode == "historical_raw":
+            if not (sd_str and ed_str):
                 return lambda_response(400, "historical_raw requires start_date and end_date")
-            return handle_historical_raw(fetcher, start_date, end_date, context)
 
-        elif mode == 'historical_chunk':
-            if not start_date or not end_date:
-                return lambda_response(400, "historical_chunk requires start_date and end_date")
-            return handle_historical_chunk(fetcher, start_date, end_date)
+            # 1) Boxscores
+            box_res = fetch_boxscores_for_range(sd_str, ed_str)
 
-        elif mode == 'historical_agg':
-            year = event.get('year')
-            return handle_historical_aggregations(fetcher, year, context)
+            # 2) Statcast (pitchers & batters)
+            sf      = StatcastFetcher()
+            pit_res = sf.fetch_and_store_pitchers(sd_str, ed_str)
+            bat_res = sf.fetch_and_store_batters(sd_str, ed_str)
 
-        elif mode == 'boxscores_raw':
-            # Single-day boxscores
-            date_str = event.get('date')
-            if not date_str:
-                return lambda_response(400, "boxscores_raw requires date (YYYY-MM-DD)")
-            target = datetime.strptime(date_str, "%Y-%m-%d").date()
-            df = fetcher._fetch_boxscores_simple(target, target)
-            return lambda_response(200, f"Fetched boxscores for {date_str}", df.to_dict(orient="records"))
+            # 3) Team data
+            team_res = []
+            for season in seasons:
+                team_res.append(TeamFetcher().fetch_and_store_team_batting(season))
 
-        elif mode == 'daily_update':
-            return handle_daily_update(fetcher, target_date, context)
+            results = {
+                "boxscores":           box_res,
+                "statcast_pitchers":   pit_res,
+                "statcast_batters":    bat_res,
+                "team_stats":          team_res
+            }
 
-        elif mode == 'refresh_lineups_only':
-            date_str = event.get('date')
-            if not date_str:
-                return lambda_response(400, "refresh_lineups_only requires date (YYYY-MM-DD)")
-            return handle_refresh_lineups_only(fetcher, date_str)
+            success = all(r.get("success", False) for r in results.values())
+            code    = 200 if success else 206
+            msg     = (
+                "Historical backfill complete"
+                if success
+                else f"Partial backfill; failures in {[k for k,v in results.items() if not v.get('success')]}"
+            )
+            return lambda_response(code, msg, results)
 
-        elif mode == 'health_check':
-            return handle_health_check()
+        # ─────────────── HISTORICAL AGGREGATIONS ───────────────
+        elif mode == "historical_agg":
+            if not (sd_str and ed_str):
+                return lambda_response(400, "historical_agg requires start_date and end_date")
 
+            agg_res = PitcherAggregator.aggregate_period(sd_str, ed_str)
+            success = agg_res.get("success", False)
+            code    = 200 if success else 206
+            msg     = (
+                "Historical aggregations complete"
+                if success
+                else "Historical aggregations encountered errors"
+            )
+            return lambda_response(code, msg, {"pitcher_aggs": agg_res})
+
+        # ─────────────── DAILY UPDATE ───────────────
+        elif mode == "daily_update":
+            # default to yesterday if no target_date
+            if tgt_str:
+                tgt_date = datetime.strptime(tgt_str, "%Y-%m-%d").date()
+            else:
+                tgt_date = date.today() - timedelta(days=1)
+            tgt_iso = tgt_date.strftime("%Y-%m-%d")
+
+            # skip outside season
+            season_bounds = get_season_date_ranges().get(tgt_date.year)
+            if season_bounds:
+                start_s, end_s = season_bounds
+                if not (start_s <= tgt_date <= end_s):
+                    return lambda_response(200, f"Date {tgt_iso} outside season—no action")
+
+            # 1) Boxscores
+            box_res = fetch_boxscores_for_date(tgt_iso)
+
+            # 2) Statcast
+            sf      = StatcastFetcher()
+            pit_res = sf.fetch_and_store_pitchers(tgt_iso, tgt_iso)
+            bat_res = sf.fetch_and_store_batters(tgt_iso, tgt_iso)
+
+            # 3) Team data
+            team_res = fetch_team_stats_for_date(tgt_iso)
+
+            # 4) Daily aggregations
+            agg_res = aggregate_starting_pitchers_for_date(tgt_iso, tgt_iso)
+
+            results = {
+                "boxscores":         box_res,
+                "statcast_pitchers": pit_res,
+                "statcast_batters":  bat_res,
+                "team_stats":        team_res,
+                "pitcher_aggs":      agg_res
+            }
+
+            success = all(r.get("success", True) for r in results.values())
+            code    = 200 if success else 206
+            msg     = (
+                f"Daily update for {tgt_iso} complete"
+                if success
+                else f"Partial daily update for {tgt_iso}"
+            )
+            return lambda_response(code, msg, results)
+
+        # ─────────────── HEALTH CHECK ───────────────
+        elif mode == "health_check":
+            # DB connectivity
+            try:
+                with RDSConnection():
+                    db_ok = True
+            except:
+                db_ok = False
+
+            # MLB API ping
+            try:
+                import requests
+                r = requests.get(
+                    "https://statsapi.mlb.com/api/v1/schedule"
+                    "?sportId=1&startDate=2025-01-01&endDate=2025-01-01",
+                    timeout=5
+                )
+                api_ok = (r.status_code == 200)
+            except:
+                api_ok = False
+
+            status = {"db_connection": db_ok, "mlb_api": api_ok}
+            code   = 200 if all(status.values()) else 500
+            return lambda_response(code, "health_check", status)
+
+        # ─────────────── UNKNOWN MODE ───────────────
         else:
             return lambda_response(400, f"Unknown mode: {mode}")
 
     except Exception as e:
-        logger.error(f"Lambda execution failed: {e}", exc_info=True)
+        logger.error("Unhandled error in lambda_handler", exc_info=e)
         return lambda_response(500, f"Internal error: {str(e)}")
-
-
-# Handlers
-
-
-def handle_historical_raw(fetcher: LambdaDataFetcher,
-                          start_date: date,
-                          end_date:   date,
-                          context) -> dict:
-    """
-    Backfill all raw data between start_date and end_date inclusive.
-    """
-    logger.info(f"Starting historical_raw from {start_date} to {end_date}")
-    remaining = context.get_remaining_time_in_millis() / 1000 if context else None
-    logger.info(f"Remaining time: {remaining}s")
-
-    # Raw fetches
-    p = fetcher.fetch_statcast_pitchers_for_period(start_date, end_date)
-    b = fetcher.fetch_statcast_batters_for_period(start_date, end_date)
-    x = fetcher.fetch_mlb_boxscores_for_period(start_date, end_date)
-
-    success = all(res.get('success', False) for res in (p, b, x))
-    results = {'pitchers': p, 'batters': b, 'boxscores': x}
-
-    if success:
-        return lambda_response(200, f"Raw backfill complete: {start_date}→{end_date}", results)
-    else:
-        failed = [k for k,v in results.items() if not v.get('success', False)]
-        return lambda_response(206,
-            f"Partial backfill; failures in {failed}",
-            results)
-
-
-def handle_historical_chunk(fetcher: LambdaDataFetcher,
-                            start_date: date,
-                            end_date:   date) -> dict:
-    logger.info(f"Starting historical_chunk from {start_date} to {end_date}")
-    p = fetcher.fetch_statcast_pitchers_for_period(start_date, end_date)
-    b = fetcher.fetch_statcast_batters_for_period(start_date, end_date)
-    x = fetcher.fetch_mlb_boxscores_for_period(start_date, end_date)
-    team = fetcher.fetch_team_season_batting(start_date.year)
-    return {'pitchers': p, 'batters': b, 'boxscores': x, 'team_batting': team}
-
-
-def handle_historical_aggregations(fetcher: LambdaDataFetcher, year: int, context) -> dict:
-    if not year:
-        return lambda_response(400, "Year parameter required for historical_agg mode")
-    logger.info(f"Starting historical aggregations for {year}")
-    results = fetcher.aggregate_year_data(year)
-    if results.get('success'):
-        return lambda_response(200, f"Successfully aggregated data for {year}", results)
-    else:
-        return lambda_response(206, f"Partial failure aggregating data for {year}", results)
-
-
-def handle_daily_update(fetcher: LambdaDataFetcher, target_date: date, context) -> dict:
-    # Default to yesterday
-    if not target_date:
-        target_date = date.today() - timedelta(days=1)
-    logger.info(f"Starting daily update for {target_date}")
-    # Validate
-    try:
-        target_obj = target_date
-    except Exception:
-        return lambda_response(400, f"Invalid date format: {target_date}")
-
-    # Season check
-    sd = get_season_date_ranges()
-    year = target_obj.year
-    if year in sd:
-        start_s, end_s = sd[year]
-        if not (start_s <= target_obj <= end_s):
-            return lambda_response(200, f"Date {target_obj} outside season - no action")
-    # Fetch
-    res = {}
-    res['pitchers'] = fetcher.fetch_statcast_pitchers_for_period(target_obj, target_obj)
-    res['batters'] = fetcher.fetch_statcast_batters_for_period(target_obj, target_obj)
-    res['boxscores'] = fetcher.fetch_mlb_boxscores_for_period(target_obj, target_obj)
-    res['agg_pitchers'] = fetcher.aggregate_starting_pitchers_for_period(target_obj, target_obj)
-    res['team_batting'] = fetcher.fetch_team_season_batting(year)
-    next_day = target_obj + timedelta(days=1)
-    if year in sd and sd[year][0] <= next_day <= sd[year][1]:
-        res['probable_lineups'] = fetcher.fetch_probable_pitchers_and_lineups(next_day)
-    success = sum(bool(v) for v in res.values())
-    if success == len(res):
-        return lambda_response(200, f"Successfully processed daily update for {target_obj}", res)
-    else:
-        return lambda_response(206, f"Partial success for daily update {target_obj}", res)
-
-def handle_refresh_lineups_only(fetcher: LambdaDataFetcher, date_str: str) -> dict:
-    try:
-        target = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except Exception:
-        return lambda_response(400, f"Invalid date: {date_str}")
-    ok = fetcher.fetch_probable_pitchers_and_lineups(target)
-    return lambda_response(200 if ok else 500, "refresh_lineups_only", {"lineups_refreshed": ok})
-
-def handle_health_check() -> dict:
-    # DB
-    try:
-        with RDSConnection() as conn:
-            pass
-        db_ok = True
-    except:
-        db_ok = False
-    # API
-    try:
-        r = requests.get("https://statsapi.mlb.com/api/v1/schedule?sportId=1&startDate=2025-01-01&endDate=2025-01-01", timeout=5)
-        api_ok = r.status_code == 200
-    except:
-        api_ok = False
-    status = {"db_connection": db_ok, "mlb_api": api_ok}
-    code = 200 if all(status.values()) else 500
-    return lambda_response(code, "health_check", status)
