@@ -8,3 +8,4 @@ layer/
 lambda-layer/
 infra/
 .aws-sam/
+env.json

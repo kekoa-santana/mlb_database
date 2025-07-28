@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 env_path = os.path.join(os.path.dirname(__file__), "config", ".env")
 load_dotenv(dotenv_path=env_path)
 
+print("ENV VARS:", dict(os.environ))
+
 from lambda_utils import (
     create_database_tables,
     lambda_response,
