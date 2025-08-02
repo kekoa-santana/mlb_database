@@ -103,8 +103,9 @@ def store_dataframe_to_rds(df: pd.DataFrame,
     # (pre-filter existing rows exactly as before)
     rds = RDSConnection()
     if pk_cols and date_col in df.columns:
-        start = df[date_col].min().strftime('%Y-%m-%d')
-        end   = df[date_col].max().strftime('%Y-%m-%d')
+        series = pd.to_datetime(df[date_col])
+        start  = series.min().strftime('%Y-%m-%d')
+        end    = series.max().strftime('%Y-%m-%d')
         sql   = f"SELECT {','.join(pk_cols)} FROM {table_name} WHERE {date_col} BETWEEN '{start}' AND '{end}'"
         with rds as conn:
             existing = pd.read_sql(sql, conn)
@@ -355,7 +356,7 @@ def create_database_tables():
         
         'mlb_boxscores': '''
         CREATE TABLE IF NOT EXISTS mlb_boxscores (
-            game_pk                       BIGINT             PRIMARY KEY,
+            game_pk                       NUMERIC(20,0)             PRIMARY KEY,
             game_date                     DATE,
             away_team                     VARCHAR(10),
             home_team                     VARCHAR(10),
@@ -363,24 +364,24 @@ def create_database_tables():
             double_header                 VARCHAR(10),
 
             -- full rosters
-            away_batters_ids              BIGINT[]           NOT NULL,
-            home_batters_ids              BIGINT[]           NOT NULL,
-            away_pitchers_ids             BIGINT[]           NOT NULL,
-            home_pitchers_ids             BIGINT[]           NOT NULL,
+            away_batters_ids              NUMERIC(20,0)[]           NOT NULL,
+            home_batters_ids              NUMERIC(20,0)[]           NOT NULL,
+            away_pitchers_ids             NUMERIC(20,0)[]           NOT NULL,
+            home_pitchers_ids             NUMERIC(20,0)[]           NOT NULL,
 
             -- position groups
-            away_bench_ids                BIGINT[],
-            home_bench_ids                BIGINT[],
-            away_bullpen_ids              BIGINT[],
-            home_bullpen_ids              BIGINT[],
+            away_bench_ids                NUMERIC(20,0)[],
+            home_bench_ids                NUMERIC(20,0)[],
+            away_bullpen_ids              NUMERIC(20,0)[],
+            home_bullpen_ids              NUMERIC(20,0)[],
 
             -- batting order
-            away_batting_order            BIGINT[],
-            home_batting_order            BIGINT[],
+            away_batting_order            NUMERIC(20,0)[],
+            home_batting_order            NUMERIC(20,0)[],
 
             -- starters
-            away_starting_pitcher_id      BIGINT,
-            home_starting_pitcher_id      BIGINT,
+            away_starting_pitcher_id      NUMERIC(20,0),
+            home_starting_pitcher_id      NUMERIC(20,0),
 
             -- umpires
             hp_umpire                     VARCHAR(100),

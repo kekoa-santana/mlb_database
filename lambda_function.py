@@ -75,17 +75,23 @@ def lambda_handler(event, context):
             bat_res = sf.fetch_and_store_batters(sd_str, ed_str)
         
             results = {
-                "boxscores":         box_res,
-                "statcast_pitchers": pit_res,
-                "statcast_batters":  bat_res,
+                "boxscores": BoxscoreFetcher.fetch_and_store_range(sd_str, ed_str),
+                "statcast": {
+                    "pitchers": StatcastFetcher().fetch_and_store_pitchers(sd_str, ed_str),
+                    "batters":  StatcastFetcher().fetch_and_store_batters( sd_str, ed_str),
+                },
             }
 
             # update your success/failure logic to handle nested dicts:
             # Flatten every r.get("success") check
             all_ok = True
-            for section in results.values():
-                if isinstance(section, dict):
-                    all_ok &= all(r.get("success", False) for r in section.values())
+            for name, section in results.items():
+                 #  If this dict is a *group* (no direct 'success' key), dive one level deeper
+                if isinstance(section, dict) and "success" not in section:
+                    for subkey, r in section.items():
+                        all_ok &= r.get("success", False)
+                # ────────────────────────────────────────────────
+                #  Otherwise this is a single-fetcher result‐dict
                 else:
                     all_ok &= section.get("success", False)
             code = 200 if all_ok else 206
@@ -93,12 +99,12 @@ def lambda_handler(event, context):
             # Build a list of failures by key
             failures = []
             for name, section in results.items():
-                if isinstance(section, dict):
+                if isinstance(section, dict) and "success" not in section:
                     for subkey, r in section.items():
-                        if not r.get("success", False):
+                        if not r.get("success", True):
                             failures.append(f"{name}:{subkey}")
                 else:
-                    if not section.get("success", False):
+                    if not section.get("success", True):
                         failures.append(name)
 
             msg = (
@@ -151,23 +157,30 @@ def lambda_handler(event, context):
             agg_res = PitcherAggregator.aggregate_period(tgt_iso, tgt_iso)
 
             results = {
-                "boxscores":         box_res,
-                "statcast_pitchers": pit_res,
-                "statcast_batters":  bat_res,
-                "pitcher_aggs":      agg_res
+                "boxscores": BoxscoreFetcher.fetch_and_store_range(sd_str, ed_str),
+                "statcast": {
+                    "pitchers": StatcastFetcher().fetch_and_store_pitchers(sd_str, ed_str),
+                    "batters":  StatcastFetcher().fetch_and_store_batters( sd_str, ed_str),
+                },
+                "pitcher_aggs": agg_res,
             }
 
             all_ok = True
-            for section in results.values():
-                if isinstance(section, dict):
-                    all_ok &= all(r.get("success", False) for r in section.values())
+            for name, section in results.items():
+                 #  If this dict is a *group* (no direct 'success' key), dive one level deeper
+                if isinstance(section, dict) and "success" not in section:
+                    for subkey, r in section.items():
+                        all_ok &= r.get("success", False)
+                # ────────────────────────────────────────────────
+                #  Otherwise this is a single-fetcher result‐dict
                 else:
-                    all_ok &= section.get("success", True)
+                    all_ok &= section.get("success", False)
             code = 200 if all_ok else 206
 
+            # Build a list of failures by key
             failures = []
             for name, section in results.items():
-                if isinstance(section, dict):
+                if isinstance(section, dict) and "success" not in section:
                     for subkey, r in section.items():
                         if not r.get("success", True):
                             failures.append(f"{name}:{subkey}")
