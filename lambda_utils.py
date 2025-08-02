@@ -5,8 +5,9 @@ import psycopg2
 import pandas as pd
 import json
 from datetime import datetime
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, MetaData, Table
 from sqlalchemy.pool import NullPool
+from sqlalchemy.dialects.postgresql import insert
 
 # Configure logging for Lambda
 logger = logging.getLogger()
@@ -52,60 +53,84 @@ class RDSConnection:
         uri = f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
         return create_engine(uri, poolclass=NullPool)
 
+def upsert_dataframe(df: pd.DataFrame,
+                     table_name: str,
+                     engine,
+                     pk_cols: list[str]) -> int:
+    """
+    Bulk UPSERT a DataFrame into Postgres, updating on PK conflict.
+    Returns number of rows processed.
+    """
+    metadata = MetaData()
+    tbl = Table(table_name, metadata, autoload_with=engine)
+
+    records = df.to_dict(orient="records")
+    stmt = insert(tbl).values(records)
+
+    # On conflict, update all non-PK columns to the new values
+    update_cols = {
+        col.name: stmt.excluded[col.name]
+        for col in tbl.columns
+        if col.name not in pk_cols
+    }
+    stmt = stmt.on_conflict_do_update(
+        index_elements=pk_cols,
+        set_=update_cols
+    )
+
+    with engine.begin() as conn:
+        result = conn.execute(stmt)
+    return result.rowcount
+
 
 def store_dataframe_to_rds(df: pd.DataFrame,
                           table_name: str,
                           if_exists: str = 'append',
-                          date_col: str = 'game_date') -> bool:
-    """Store DataFrame to RDS, skipping rows already present via pre-filtering."""
+                          date_col: str = 'game_date') -> int:
+    """Store (or upsert) DataFrame to RDS, skipping rows already present."""
     if df.empty:
         logger.info(f"Empty DataFrame for {table_name}, skipping")
-        return True
+        return 0
 
-    # Primary key columns per table
     pk_map = {
-        'statcast_pitchers':       ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
-        'statcast_batters':        ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
-        'mlb_boxscores':           ['game_pk'],
-        'season_team_batting':     ['game_pk'],
-        # add others as necessary
+        'statcast_pitchers': ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
+        'statcast_batters':  ['game_pk','pitcher','batter','pitch_number','at_bat_number'],
+        'mlb_boxscores':     ['game_pk'],
+        'team_game_logs':    ['game_date','team','game_number'],
     }
-    pk_cols = pk_map.get(table_name)
+    pk_cols = pk_map.get(table_name, [])
 
+    # (pre-filter existing rows exactly as before)
     rds = RDSConnection()
-    # Pre-filter existing rows if possible
     if pk_cols and date_col in df.columns:
         start = df[date_col].min().strftime('%Y-%m-%d')
-        end = df[date_col].max().strftime('%Y-%m-%d')
-        sql = f"SELECT {', '.join(pk_cols)} FROM {table_name} WHERE {date_col} BETWEEN '{start}' AND '{end}'"
+        end   = df[date_col].max().strftime('%Y-%m-%d')
+        sql   = f"SELECT {','.join(pk_cols)} FROM {table_name} WHERE {date_col} BETWEEN '{start}' AND '{end}'"
         with rds as conn:
             existing = pd.read_sql(sql, conn)
+
         merged = df.merge(existing, on=pk_cols, how='left', indicator=True)
-        new_df = merged[merged['_merge']=='left_only'].drop(columns=['_merge'] + pk_cols)
+        new_df = merged[merged['_merge']=='left_only'].drop(columns=['_merge'])
     else:
         new_df = df.copy()
 
     if new_df.empty:
         logger.info(f"No new rows for {table_name} (all duplicates or missing date_col)")
-        return True
+        return 0
 
-    # Write new rows
+    # replace any NaN/NaT/pd.NA in new_df with None so SQLAlchemy writes NULL
+    new_df = new_df.where(pd.notnull(new_df), None)
+    # UPSERT new rows
     engine = rds.get_sqlalchemy_engine()
-    num_cols = len(new_df.columns)
-    SQLITE_MAX_VARS = 30000
-    chunksize = max(1, min(SQLITE_MAX_VARS // num_cols, 1000))
-
-    logger.info(f"Storing {len(new_df)} NEW rows to {table_name} (chunksize={chunksize})")
-    new_df.to_sql(
-        name=table_name,
-        con=engine,
-        if_exists=if_exists,
-        index=False,
-        chunksize=chunksize,
-        method='multi'
+    logger.info(f"Upserting {len(new_df)} rows into {table_name}")
+    written = upsert_dataframe(
+        df=new_df,
+        table_name=table_name,
+        engine=engine,
+        pk_cols=pk_cols
     )
-    logger.info(f"Successfully stored {len(new_df)} rows to {table_name}")
-    return True
+    logger.info(f"Upsert complete: {written} rows processed into {table_name}")
+    return written
 
 
 def get_season_date_ranges() -> dict:
@@ -329,30 +354,51 @@ def create_database_tables():
         ''',
         
         'mlb_boxscores': '''
-            CREATE TABLE IF NOT EXISTS mlb_boxscores (
-                game_pk BIGINT PRIMARY KEY,
-                game_date DATE,
-                away_team VARCHAR(10),
-                home_team VARCHAR(10),
-                game_number INTEGER,
-                double_header VARCHAR(10),
-                away_pitcher_ids TEXT,
-                home_pitcher_ids TEXT,
-                away_starting_pitcher_id INTEGER,
-                home_starting_pitcher_id INTEGER,
-                hp_umpire VARCHAR(100),
-                umpire_1b VARCHAR(100),
-                umpire_2b VARCHAR(100), 
-                umpire_3b VARCHAR(100),
-                weather VARCHAR(100),
-                temp FLOAT,
-                wind VARCHAR(100),
-                elevation FLOAT,
-                day_night VARCHAR(10),
-                first_pitch VARCHAR(20),
-                scraped_timestamp TIMESTAMP
+        CREATE TABLE IF NOT EXISTS mlb_boxscores (
+            game_pk                       BIGINT             PRIMARY KEY,
+            game_date                     DATE,
+            away_team                     VARCHAR(10),
+            home_team                     VARCHAR(10),
+            game_number                   INTEGER,
+            double_header                 VARCHAR(10),
+
+            -- full rosters
+            away_batters_ids              BIGINT[]           NOT NULL,
+            home_batters_ids              BIGINT[]           NOT NULL,
+            away_pitchers_ids             BIGINT[]           NOT NULL,
+            home_pitchers_ids             BIGINT[]           NOT NULL,
+
+            -- position groups
+            away_bench_ids                BIGINT[],
+            home_bench_ids                BIGINT[],
+            away_bullpen_ids              BIGINT[],
+            home_bullpen_ids              BIGINT[],
+
+            -- batting order
+            away_batting_order            BIGINT[],
+            home_batting_order            BIGINT[],
+
+            -- starters
+            away_starting_pitcher_id      BIGINT,
+            home_starting_pitcher_id      BIGINT,
+
+            -- umpires
+            hp_umpire                     VARCHAR(100),
+            umpire_1b                     VARCHAR(100),
+            umpire_2b                     VARCHAR(100),
+            umpire_3b                     VARCHAR(100),
+
+            -- conditions
+            weather                       VARCHAR(100),
+            temp                          FLOAT,
+            wind                          VARCHAR(100),
+            elevation                     FLOAT,
+            day_night                     VARCHAR(10),
+            first_pitch                   VARCHAR(20),
+
+            scraped_timestamp             TIMESTAMP
             );
-        ''',
+    ''',
         
         'game_level_starting_pitchers': '''
             CREATE TABLE IF NOT EXISTS game_level_starting_pitchers (
@@ -610,12 +656,10 @@ DB_COLUMNS = {
     "statcast_batters": [
         "pitch_type", "game_date", "release_speed", "release_pos_x", "release_pos_z",
         "player_name", "batter", "pitcher", "events", "description", "spin_dir",
-        "spin_rate_deprecated", "break_angle_deprecated", "break_length_deprecated",
-        "zone", "des", "game_type", "stand", "p_throws", "home_team", "away_team",
+        "zone", "game_type", "stand", "p_throws", "home_team", "away_team",
         "type", "hit_location", "bb_type", "balls", "strikes", "game_year", "pfx_x",
         "pfx_z", "plate_x", "plate_z", "on_3b", "on_2b", "on_1b", "outs_when_up",
-        "inning", "inning_topbot", "hc_x", "hc_y", "tfs_deprecated",
-        "tfs_zulu_deprecated", "umpire", "sv_id", "vx0", "vy0", "vz0", "ax", "ay",
+        "inning", "inning_topbot", "hc_x", "hc_y", "vx0", "vy0", "vz0", "ax", "ay",
         "az", "sz_top", "sz_bot", "hit_distance_sc", "launch_speed", "launch_angle",
         "effective_speed", "release_spin_rate", "release_extension", "game_pk",
         "fielder_2", "fielder_3", "fielder_4", "fielder_5", "fielder_6", "fielder_7",
@@ -623,16 +667,17 @@ DB_COLUMNS = {
         "estimated_ba_using_speedangle", "estimated_woba_using_speedangle",
         "woba_value", "woba_denom", "babip_value", "iso_value", "launch_speed_angle",
         "at_bat_number", "pitch_number", "pitch_name", "home_score", "away_score",
-        "bat_score", "fld_score", "post_away_score", "post_home_score",
-        "post_bat_score", "post_fld_score", "if_fielding_alignment",
+        "post_away_score", "post_home_score", "if_fielding_alignment",
         "of_fielding_alignment", "spin_axis", "delta_home_win_exp", "delta_run_exp",
-        "bat_speed", "swing_length", "estimated_slg_using_speedangle",
-        "delta_pitcher_run_exp", "hyper_speed", "home_score_diff", "bat_score_diff",
-        "home_win_exp", "bat_win_exp", "age_pit_legacy", "age_bat_legacy", "age_pit",
-        "age_bat", "n_thruorder_pitcher", "n_priorpa_thisgame_player_at_bat",
-        "pitcher_days_since_prev_game", "batter_days_since_prev_game",
-        "pitcher_days_until_next_game", "batter_days_until_next_game",
-        "api_break_z_with_gravity", "api_break_x_arm",
-        "api_break_x_batter_in", "arm_angle", "season"
+        "n_thruorder_pitcher", "attack_angle", "attack_direction",
+        "bat_score", "swing_path_tilt", "season"
+    ],
+    "mlb_boxscores": [
+        'game_pk','game_date','away_team','home_team','game_number','double_header',
+        'away_batters_ids','home_batters_ids','away_pitchers_ids','home_pitchers_ids',
+        'away_bench_ids','home_bench_ids','away_bullpen_ids', 'home_bullpen_ids',
+        'away_batting_order','home_batting_order','away_starting_pitcher_id',
+        'home_starting_pitcher_id','hp_umpire','umpire_1b', 'umpire_2b', 'umpire_3b',
+        'weather','temp','wind','elevation','day_night','first_pitch', 'scraped_timestamp'
     ]
 }

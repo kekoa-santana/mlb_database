@@ -17,16 +17,18 @@ from lambda_utils import (
 )
 
 # EXPLICIT FETCHER IMPORTS
-from data_fetchers.boxscore_fetcher import (
-    fetch_boxscores_for_range,
-    fetch_boxscores_for_date
-)
+from data_fetchers.boxscore_fetcher import BoxscoreFetcher
 from data_fetchers.statcast_fetcher import StatcastFetcher
-from data_fetchers.team_fetcher import TeamFetcher
 
 # EXPLICIT AGGREGATOR IMPORTS
 from aggregators.pitcher_aggregator import PitcherAggregator
 
+# Team abbreviations from Baseball Reference
+TEAMS = [
+    "ARI","ATL","BAL","BOS","CHC","CIN","CLE","COL","DET","HOU",
+    "KC", "LAA","LAD","MIA","MIL","MIN","NYM","NYY","OAK","PHI",
+    "PIT","SD","SEA","SF","STL","TB","TEX","TOR","WAS","CHW"
+]
 
 def lambda_handler(event, context):
     """
@@ -63,31 +65,46 @@ def lambda_handler(event, context):
                 return lambda_response(400, "historical_raw requires start_date and end_date")
 
             # 1) Boxscores
-            box_res = fetch_boxscores_for_range(sd_str, ed_str)
+            logger.info(f"≡ Starting boxscore backfill from {sd_str} to {ed_str}")
+            box_res = BoxscoreFetcher.fetch_and_store_range(sd_str, ed_str)
+            logger.info(f"→ Boxscore backfill result: {box_res}")
 
             # 2) Statcast (pitchers & batters)
             sf      = StatcastFetcher()
             pit_res = sf.fetch_and_store_pitchers(sd_str, ed_str)
             bat_res = sf.fetch_and_store_batters(sd_str, ed_str)
-
-            # 3) Team data
-            team_res = []
-            for season in seasons:
-                team_res.append(TeamFetcher().fetch_and_store_team_batting(season))
-
+        
             results = {
-                "boxscores":           box_res,
-                "statcast_pitchers":   pit_res,
-                "statcast_batters":    bat_res,
-                "team_stats":          team_res
+                "boxscores":         box_res,
+                "statcast_pitchers": pit_res,
+                "statcast_batters":  bat_res,
             }
 
-            success = all(r.get("success", False) for r in results.values())
-            code    = 200 if success else 206
-            msg     = (
+            # update your success/failure logic to handle nested dicts:
+            # Flatten every r.get("success") check
+            all_ok = True
+            for section in results.values():
+                if isinstance(section, dict):
+                    all_ok &= all(r.get("success", False) for r in section.values())
+                else:
+                    all_ok &= section.get("success", False)
+            code = 200 if all_ok else 206
+
+            # Build a list of failures by key
+            failures = []
+            for name, section in results.items():
+                if isinstance(section, dict):
+                    for subkey, r in section.items():
+                        if not r.get("success", False):
+                            failures.append(f"{name}:{subkey}")
+                else:
+                    if not section.get("success", False):
+                        failures.append(name)
+
+            msg = (
                 "Historical backfill complete"
-                if success
-                else f"Partial backfill; failures in {[k for k,v in results.items() if not v.get('success')]}"
+                if all_ok
+                else f"Partial backfill; failures in {failures}"
             )
             return lambda_response(code, msg, results)
 
@@ -123,61 +140,47 @@ def lambda_handler(event, context):
                     return lambda_response(200, f"Date {tgt_iso} outside season—no action")
 
             # 1) Boxscores
-            box_res = fetch_boxscores_for_date(tgt_iso)
+            box_res = BoxscoreFetcher.fetch_and_store_date(tgt_iso)
 
             # 2) Statcast
             sf      = StatcastFetcher()
             pit_res = sf.fetch_and_store_pitchers(tgt_iso, tgt_iso)
             bat_res = sf.fetch_and_store_batters(tgt_iso, tgt_iso)
 
-            # 3) Team data
-            team_res = fetch_team_stats_for_date(tgt_iso)
-
-            # 4) Daily aggregations
-            agg_res = aggregate_starting_pitchers_for_date(tgt_iso, tgt_iso)
+            # 3) Daily aggregations
+            agg_res = PitcherAggregator.aggregate_period(tgt_iso, tgt_iso)
 
             results = {
                 "boxscores":         box_res,
                 "statcast_pitchers": pit_res,
                 "statcast_batters":  bat_res,
-                "team_stats":        team_res,
                 "pitcher_aggs":      agg_res
             }
 
-            success = all(r.get("success", True) for r in results.values())
-            code    = 200 if success else 206
-            msg     = (
+            all_ok = True
+            for section in results.values():
+                if isinstance(section, dict):
+                    all_ok &= all(r.get("success", False) for r in section.values())
+                else:
+                    all_ok &= section.get("success", True)
+            code = 200 if all_ok else 206
+
+            failures = []
+            for name, section in results.items():
+                if isinstance(section, dict):
+                    for subkey, r in section.items():
+                        if not r.get("success", True):
+                            failures.append(f"{name}:{subkey}")
+                else:
+                    if not section.get("success", True):
+                        failures.append(name)
+
+            msg = (
                 f"Daily update for {tgt_iso} complete"
-                if success
-                else f"Partial daily update for {tgt_iso}"
+                if all_ok
+                else f"Partial daily update; failures in {failures}"
             )
             return lambda_response(code, msg, results)
-
-        # ─────────────── HEALTH CHECK ───────────────
-        elif mode == "health_check":
-            # DB connectivity
-            try:
-                with RDSConnection():
-                    db_ok = True
-            except:
-                db_ok = False
-
-            # MLB API ping
-            try:
-                import requests
-                r = requests.get(
-                    "https://statsapi.mlb.com/api/v1/schedule"
-                    "?sportId=1&startDate=2025-01-01&endDate=2025-01-01",
-                    timeout=5
-                )
-                api_ok = (r.status_code == 200)
-            except:
-                api_ok = False
-
-            status = {"db_connection": db_ok, "mlb_api": api_ok}
-            code   = 200 if all(status.values()) else 500
-            return lambda_response(code, "health_check", status)
-
         # ─────────────── UNKNOWN MODE ───────────────
         else:
             return lambda_response(400, f"Unknown mode: {mode}")
