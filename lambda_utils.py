@@ -379,10 +379,6 @@ def create_database_tables():
             away_batting_order            NUMERIC(20,0)[],
             home_batting_order            NUMERIC(20,0)[],
 
-            -- starters
-            away_starting_pitcher_id      NUMERIC(20,0),
-            home_starting_pitcher_id      NUMERIC(20,0),
-
             -- umpires
             hp_umpire                     VARCHAR(100),
             umpire_1b                     VARCHAR(100),
@@ -589,17 +585,15 @@ def create_database_tables():
             );
         ''',
         
-        'probable_lineup': '''
-            CREATE TABLE IF NOT EXISTS probable_lineup (
-                game_pk BIGINT,
-                game_date DATE,
-                team VARCHAR(10),
-                home_probable_pitcher_id INTEGER,
-                home_probable_pitcher_name VARCHAR(100),
-                away_probable_pitcher_id INTEGER, 
-                away_probable_pitcher_name VARCHAR(100),
-                scraped_timestamp TIMESTAMP,
-                PRIMARY KEY (game_pk, team)
+        'probable_pitchers': '''
+            CREATE TABLE IF NOT EXISTS probable_pitchers (
+                game_pk                         BIGINT PRIMARY KEY,
+                game_date                       DATE NOT NULL,
+                home_probable_pitcher_id        INTEGER,
+                home_probable_pitcher_name      VARCHAR(100),
+                away_probable_pitcher_id        INTEGER, 
+                away_probable_pitcher_name      VARCHAR(100),
+                scraped_timestamp               TIMESTAMP NOT NULL DEFAULT NOW()
             );
         ''',
         
@@ -677,8 +671,8 @@ DB_COLUMNS = {
         'game_pk','game_date','away_team','home_team','game_number','double_header',
         'away_batters_ids','home_batters_ids','away_pitchers_ids','home_pitchers_ids',
         'away_bench_ids','home_bench_ids','away_bullpen_ids', 'home_bullpen_ids',
-        'away_batting_order','home_batting_order','away_starting_pitcher_id',
-        'home_starting_pitcher_id','hp_umpire','umpire_1b', 'umpire_2b', 'umpire_3b',
-        'weather','temp','wind','elevation','day_night','first_pitch', 'scraped_timestamp'
+        'away_batting_order','home_batting_order', 'hp_umpire','umpire_1b', 
+        'umpire_2b', 'umpire_3b', 'weather','temp','wind','elevation','day_night',
+        'first_pitch', 'scraped_timestamp'
     ]
 }

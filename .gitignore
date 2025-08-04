@@ -9,3 +9,4 @@ lambda-layer/
 infra/
 .aws-sam/
 env.json
+output_example.json

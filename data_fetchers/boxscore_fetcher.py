@@ -74,8 +74,6 @@ class BoxscoreFetcher:
             "home_bullpen_ids":         teams["home"].get("bullpen", []),
             "away_batting_order":       teams["away"].get("battingOrder", []),
             "home_batting_order":       teams["home"].get("battingOrder", []),
-            "away_starting_pitcher_id": teams["away"].get("pitchers", [None])[0],
-            "home_starting_pitcher_id": teams["home"].get("pitchers", [None])[0],
             "hp_umpire":                None,
             "umpire_1b":                None,
             "umpire_2b":                None,
@@ -180,6 +178,40 @@ class BoxscoreFetcher:
             conn.commit()
 
         return len(tuples)
+
+    @classmethod
+    def _fetch_probable_pitchers_for_date(cls, date_str: str) -> list[dict]:
+        logger.info("🔥 ENTERING _fetch_probable_pitchers_for_date (new code!) for date %s", date_str)
+        """
+        Hits /schedule?sportId=1&date=…&hydrate=probablePitchers
+        and returns a list of dicts with:
+            - game_pk
+            - game_date
+            - home_probable_pitcher_id
+            - away_probable_pitcher_id
+        """
+        url    = f"{cls.BASE_URL}/schedule"
+        params = {
+            "sportId": 1,
+            "date":    date_str,
+            "hydrate": "probablePitchers"
+        }
+        resp = requests.get(url, params=params)
+        resp.raise_for_status()
+        dates = resp.json().get("dates", [])
+        
+        rows = []
+        for day in dates:
+            for g in day.get("games", []):
+                pp = g.get("probablePitchers", {})
+                teams = g.get("teams", {})
+                rows.append({
+                    "game_pk":                  g["gamePk"],
+                    "game_date":                g["gameDate"],
+                    "home_probable_pitcher_id": pp.get("home", {}).get("id"),
+                    "away_probable_pitcher_id": pp.get("away", {}).get("id"),
+                })
+        return rows
 
 
 # Lambda entry‐points

@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 import json
 from datetime import date, datetime, timedelta
+import pandas as pd
 
 env_path = os.path.join(os.path.dirname(__file__), "config", ".env")
 load_dotenv(dotenv_path=env_path)
@@ -148,36 +149,53 @@ def lambda_handler(event, context):
             # 1) Boxscores
             box_res = BoxscoreFetcher.fetch_and_store_date(tgt_iso)
 
+            # Get tomorrow probable pitchers
+            tomorrow = (tgt_date + timedelta(days=1)).strftime("%Y-%m-%d")
+            prob_rows = BoxscoreFetcher._fetch_probable_pitchers_for_date(tomorrow)
+            if prob_rows:
+                df_prob = pd.DataFrame(prob_rows)
+                prob_written = BoxscoreFetcher._upsert_to_rds(
+                    df_prob,
+                    table="probable_pitchers",
+                    conflict_column="game_pk"
+                )
+                logger.info(f"Upserted {prob_written} probables for {tomorrow}")
+                prob_res = {"success": True, "rows": prob_written}
+            else:
+                logger.info(f"No probables found for {tomorrow}")
+                prob_res = {"success": True, "rows": 0}
+
             # 2) Statcast
             sf      = StatcastFetcher()
             pit_res = sf.fetch_and_store_pitchers(tgt_iso, tgt_iso)
             bat_res = sf.fetch_and_store_batters(tgt_iso, tgt_iso)
 
             # 3) Daily aggregations
-            agg_res = PitcherAggregator.aggregate_period(tgt_iso, tgt_iso)
+            # agg_res = PitcherAggregator.aggregate_period(tgt_iso, tgt_iso)
 
             results = {
-                "boxscores": BoxscoreFetcher.fetch_and_store_range(sd_str, ed_str),
+                "boxscores": box_res,
                 "statcast": {
-                    "pitchers": StatcastFetcher().fetch_and_store_pitchers(sd_str, ed_str),
-                    "batters":  StatcastFetcher().fetch_and_store_batters( sd_str, ed_str),
+                    "pitchers": pit_res,
+                    "batters":  bat_res,
                 },
-                "pitcher_aggs": agg_res,
+                "probables": prob_res,
+                # "pitcher_aggs": agg_res,
             }
 
+            # Compute overall status
             all_ok = True
             for name, section in results.items():
-                 #  If this dict is a *group* (no direct 'success' key), dive one level deeper
                 if isinstance(section, dict) and "success" not in section:
+                    # nested dict (e.g. statcast)
                     for subkey, r in section.items():
                         all_ok &= r.get("success", False)
-                # ────────────────────────────────────────────────
-                #  Otherwise this is a single-fetcher result‐dict
                 else:
                     all_ok &= section.get("success", False)
+
             code = 200 if all_ok else 206
 
-            # Build a list of failures by key
+            # List any failures
             failures = []
             for name, section in results.items():
                 if isinstance(section, dict) and "success" not in section:
@@ -190,8 +208,8 @@ def lambda_handler(event, context):
 
             msg = (
                 f"Daily update for {tgt_iso} complete"
-                if all_ok
-                else f"Partial daily update; failures in {failures}"
+                if all_ok else
+                f"Partial daily update; failures in {failures}"
             )
             return lambda_response(code, msg, results)
         # ─────────────── UNKNOWN MODE ───────────────
