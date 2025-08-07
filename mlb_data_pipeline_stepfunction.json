@@ -1,144 +1,48 @@
 {
-    "Comment": "MLB Data Pipeline - 4 Year Historical Backfill",
-    "StartAt": "InitializePipeline",
-    "States": {
-      "InitializePipeline": {
-        "Type": "Pass",
-        "Result": {
-          "years": [2021, 2022, 2023, 2024, 2025]
-        },
-        "Next": "ProcessYears"
-      },
-      
-      "ProcessYears": {
-        "Type": "Map",
-        "ItemsPath": "$.years",
-        "MaxConcurrency": 2,
-        "Iterator": {
-          "StartAt": "ProcessSingleYear",
-          "States": {
-            "ProcessSingleYear": {
-              "Type": "Parallel",
-              "Branches": [
-                {
-                  "StartAt": "FetchRawData",
-                  "States": {
-                    "FetchRawData": {
-                      "Type": "Task",
-                      "Resource": "arn:aws:states:::lambda:invoke",
-                      "Parameters": {
-                        "FunctionName": "mlb-data-pipeline",
-                        "Payload": {
-                          "mode": "historical_raw",
-                          "year.$": "$"
-                        }
-                      },
-                      "Retry": [
-                        {
-                          "ErrorEquals": ["States.TaskFailed"],
-                          "IntervalSeconds": 30,
-                          "MaxAttempts": 3,
-                          "BackoffRate": 2.0
-                        }
-                      ],
-                      "Catch": [
-                        {
-                          "ErrorEquals": ["States.ALL"],
-                          "Next": "RawDataFailed"
-                        }
-                      ],
-                      "End": true
-                    },
-                    "RawDataFailed": {
-                      "Type": "Pass",
-                      "Result": {
-                        "status": "failed",
-                        "step": "raw_data"
-                      },
-                      "End": true
-                    }
-                  }
-                }
-              ],
-              "Next": "CheckRawDataSuccess"
+  "Comment": "Multi‐year MLB backfill, one day per iteration",
+  "StartAt": "MapOverDates",
+  "States": {
+    "MapOverDates": {
+      "Type": "Map",
+      "ItemsPath": "$.dates",
+      "MaxConcurrency": 5,
+      "Iterator": {
+        "StartAt": "BackfillOneDay",
+        "States": {
+          "BackfillOneDay": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-2:227271426748:function:mlb-deps-ecr",
+            "TimeoutSeconds": 900,
+            "Parameters": {
+              "mode": "historical_raw",
+              "start_date.$": "$$.Map.Item.Value",
+              "end_date.$":   "$$.Map.Item.Value"
             },
-            
-            "CheckRawDataSuccess": {
-              "Type": "Choice",
-              "Choices": [
-                {
-                  "Variable": "$[0].statusCode",
-                  "NumericLessThan": 300,
-                  "Next": "ProcessAggregations"
-                }
-              ],
-              "Default": "YearProcessingFailed"
+            "Retry": [{
+              "ErrorEquals":   ["States.ALL"],
+              "IntervalSeconds": 30,
+              "MaxAttempts":     2,
+              "BackoffRate":     2.0
+            }],
+            "Catch": [{
+              "ErrorEquals": ["States.ALL"],
+              "ResultPath":  "$.errorInfo",
+              "Next":        "RecordFailure"
+            }],
+            "End": true
+          },
+          "RecordFailure": {
+            "Type": "Pass",
+            "Parameters": {
+              "failedDate.$": "$$.Map.Item.Value",
+              "error.$":      "$.errorInfo"
             },
-            
-            "ProcessAggregations": {
-              "Type": "Task",
-              "Resource": "arn:aws:states:::lambda:invoke",
-              "Parameters": {
-                "FunctionName": "mlb-data-pipeline",
-                "Payload": {
-                  "mode": "historical_agg",
-                  "year.$": "$"
-                }
-              },
-              "Retry": [
-                {
-                  "ErrorEquals": ["States.TaskFailed"],
-                  "IntervalSeconds": 15,
-                  "MaxAttempts": 2,
-                  "BackoffRate": 2.0
-                }
-              ],
-              "Catch": [
-                {
-                  "ErrorEquals": ["States.ALL"],
-                  "Next": "AggregationFailed"
-                }
-              ],
-              "Next": "YearProcessingComplete"
-            },
-            
-            "AggregationFailed": {
-              "Type": "Pass",
-              "Result": {
-                "status": "failed",
-                "step": "aggregations"
-              },
-              "End": true
-            },
-            
-            "YearProcessingComplete": {
-              "Type": "Pass",
-              "Result": {
-                "status": "success"
-              },
-              "End": true
-            },
-            
-            "YearProcessingFailed": {
-              "Type": "Pass",
-              "Result": {
-                "status": "failed",
-                "step": "raw_data"
-              },
-              "End": true
-            }
+            "ResultPath": "$.failures[0]",
+            "End": true
           }
-        },
-        "Next": "PipelineComplete"
+        }
       },
-      
-      "PipelineComplete": {
-        "Type": "Pass",
-        "Result": {
-          "message": "4-year historical backfill completed",
-          "timestamp.$": "$$.State.EnteredTime"
-        },
-        "End": true
-      }
+      "End": true
     }
   }
+}

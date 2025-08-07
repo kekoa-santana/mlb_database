@@ -22,7 +22,7 @@ from data_fetchers.boxscore_fetcher import BoxscoreFetcher
 from data_fetchers.statcast_fetcher import StatcastFetcher
 
 # EXPLICIT AGGREGATOR IMPORTS
-from aggregators.pitcher_aggregator import PitcherAggregator
+# from aggregators.pitcher_aggregator import PitcherAggregator
 
 # Team abbreviations from Baseball Reference
 TEAMS = [
@@ -116,102 +116,131 @@ def lambda_handler(event, context):
             return lambda_response(code, msg, results)
 
         # ─────────────── HISTORICAL AGGREGATIONS ───────────────
-        elif mode == "historical_agg":
-            if not (sd_str and ed_str):
-                return lambda_response(400, "historical_agg requires start_date and end_date")
+        # elif mode == "historical_agg":
+        #     if not (sd_str and ed_str):
+        #         return lambda_response(400, "historical_agg requires start_date and end_date")
 
-            agg_res = PitcherAggregator.aggregate_period(sd_str, ed_str)
-            success = agg_res.get("success", False)
-            code    = 200 if success else 206
-            msg     = (
-                "Historical aggregations complete"
-                if success
-                else "Historical aggregations encountered errors"
-            )
-            return lambda_response(code, msg, {"pitcher_aggs": agg_res})
+        #     agg_res = PitcherAggregator.aggregate_period(sd_str, ed_str)
+        #     success = agg_res.get("success", False)
+        #     code    = 200 if success else 206
+        #     msg     = (
+        #         "Historical aggregations complete"
+        #         if success
+        #         else "Historical aggregations encountered errors"
+        #     )
+        #     return lambda_response(code, msg, {"pitcher_aggs": agg_res})
 
-        # ─────────────── DAILY UPDATE ───────────────
         elif mode == "daily_update":
-            # default to yesterday if no target_date
+            # Determine date(s) to process
+            dates_to_process = []
+            
             if tgt_str:
-                tgt_date = datetime.strptime(tgt_str, "%Y-%m-%d").date()
+                # Single target date
+                dates_to_process = [datetime.strptime(tgt_str, "%Y-%m-%d").date()]
+                
+            elif sd_str and ed_str:
+                # Date range (or single date passed as start/end)
+                start_date = datetime.strptime(sd_str, "%Y-%m-%d").date()
+                end_date = datetime.strptime(ed_str, "%Y-%m-%d").date()
+                
+                # Generate all dates in range
+                current_date = start_date
+                while current_date <= end_date:
+                    dates_to_process.append(current_date)
+                    current_date += timedelta(days=1)
+                    
+                logger.info(f"Processing date range: {start_date} to {end_date} ({len(dates_to_process)} days)")
+                
             else:
-                tgt_date = date.today() - timedelta(days=1)
-            tgt_iso = tgt_date.strftime("%Y-%m-%d")
+                # Default to yesterday
+                dates_to_process = [date.today() - timedelta(days=1)]
+                logger.info("No dates specified, defaulting to yesterday")
 
-            # skip outside season
-            season_bounds = get_season_date_ranges().get(tgt_date.year)
-            if season_bounds:
-                start_s, end_s = season_bounds
-                if not (start_s <= tgt_date <= end_s):
-                    return lambda_response(200, f"Date {tgt_iso} outside season—no action")
-
-            # 1) Boxscores
-            box_res = BoxscoreFetcher.fetch_and_store_date(tgt_iso)
-
-            # Get tomorrow probable pitchers
-            tomorrow = (tgt_date + timedelta(days=1)).strftime("%Y-%m-%d")
-            prob_rows = BoxscoreFetcher._fetch_probable_pitchers_for_date(tomorrow)
-            if prob_rows:
-                df_prob = pd.DataFrame(prob_rows)
-                prob_written = BoxscoreFetcher._upsert_to_rds(
-                    df_prob,
-                    table="probable_pitchers",
-                    conflict_column="game_pk"
-                )
-                logger.info(f"Upserted {prob_written} probables for {tomorrow}")
-                prob_res = {"success": True, "rows": prob_written}
-            else:
-                logger.info(f"No probables found for {tomorrow}")
-                prob_res = {"success": True, "rows": 0}
-
-            # 2) Statcast
-            sf      = StatcastFetcher()
-            pit_res = sf.fetch_and_store_pitchers(tgt_iso, tgt_iso)
-            bat_res = sf.fetch_and_store_batters(tgt_iso, tgt_iso)
-
-            # 3) Daily aggregations
-            # agg_res = PitcherAggregator.aggregate_period(tgt_iso, tgt_iso)
-
-            results = {
-                "boxscores": box_res,
+            # Process each date
+            all_results = {
+                "boxscores": {"success": True, "rows": 0},
                 "statcast": {
-                    "pitchers": pit_res,
-                    "batters":  bat_res,
+                    "pitchers": {"success": True, "rows": 0},
+                    "batters": {"success": True, "rows": 0},
                 },
-                "probables": prob_res,
-                # "pitcher_aggs": agg_res,
+                "probables": {"success": True, "rows": 0},
+                "dates_processed": len(dates_to_process)
             }
+            
+            failed_dates = []
+            
+            for process_date in dates_to_process:
+                tgt_iso = process_date.strftime("%Y-%m-%d")
+                logger.info(f"Processing date: {tgt_iso}")
+                
+                # Skip dates outside season
+                season_bounds = get_season_date_ranges().get(process_date.year)
+                if season_bounds:
+                    start_s, end_s = season_bounds
+                    if not (start_s <= process_date <= end_s):
+                        logger.info(f"Date {tgt_iso} outside season—skipping")
+                        continue
+
+                try:
+                    # 1) Boxscores for this date
+                    box_res = BoxscoreFetcher.fetch_and_store_date(tgt_iso)
+                    all_results["boxscores"]["rows"] += box_res.get("rows", 0)
+                    if not box_res.get("success", False):
+                        all_results["boxscores"]["success"] = False
+                        failed_dates.append(f"{tgt_iso}-boxscores")
+
+                    # 2) Probables for next day
+                    tomorrow = (process_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                    prob_rows = BoxscoreFetcher._fetch_probable_pitchers_for_date(tomorrow)
+                    if prob_rows:
+                        df_prob = pd.DataFrame(prob_rows)
+                        prob_written = BoxscoreFetcher._upsert_to_rds(
+                            df_prob,
+                            table="probable_pitchers", 
+                            conflict_column="game_pk"
+                        )
+                        all_results["probables"]["rows"] += prob_written
+                    
+                    # 3) Statcast
+                    sf = StatcastFetcher()
+                    pit_res = sf.fetch_and_store_pitchers(tgt_iso, tgt_iso)
+                    bat_res = sf.fetch_and_store_batters(tgt_iso, tgt_iso)
+                    
+                    all_results["statcast"]["pitchers"]["rows"] += pit_res.get("rows", 0)
+                    all_results["statcast"]["batters"]["rows"] += bat_res.get("rows", 0)
+                    
+                    if not pit_res.get("success", False):
+                        all_results["statcast"]["pitchers"]["success"] = False
+                        failed_dates.append(f"{tgt_iso}-pitchers")
+                        
+                    if not bat_res.get("success", False):
+                        all_results["statcast"]["batters"]["success"] = False
+                        failed_dates.append(f"{tgt_iso}-batters")
+
+                except Exception as e:
+                    logger.error(f"Error processing {tgt_iso}: {e}")
+                    failed_dates.append(f"{tgt_iso}-error")
+                    continue
 
             # Compute overall status
-            all_ok = True
-            for name, section in results.items():
-                if isinstance(section, dict) and "success" not in section:
-                    # nested dict (e.g. statcast)
-                    for subkey, r in section.items():
-                        all_ok &= r.get("success", False)
-                else:
-                    all_ok &= section.get("success", False)
-
+            all_ok = (
+                all_results["boxscores"]["success"] and
+                all_results["statcast"]["pitchers"]["success"] and
+                all_results["statcast"]["batters"]["success"] and
+                all_results["probables"]["success"]
+            )
+            
             code = 200 if all_ok else 206
 
-            # List any failures
-            failures = []
-            for name, section in results.items():
-                if isinstance(section, dict) and "success" not in section:
-                    for subkey, r in section.items():
-                        if not r.get("success", True):
-                            failures.append(f"{name}:{subkey}")
+            if failed_dates:
+                msg = f"Processed {len(dates_to_process)} dates with failures: {failed_dates}"
+            else:
+                if len(dates_to_process) == 1:
+                    msg = f"Daily update for {dates_to_process[0]} complete"
                 else:
-                    if not section.get("success", True):
-                        failures.append(name)
-
-            msg = (
-                f"Daily update for {tgt_iso} complete"
-                if all_ok else
-                f"Partial daily update; failures in {failures}"
-            )
-            return lambda_response(code, msg, results)
+                    msg = f"Daily update for {len(dates_to_process)} dates complete"
+            
+            return lambda_response(code, msg, all_results)
         # ─────────────── UNKNOWN MODE ───────────────
         else:
             return lambda_response(400, f"Unknown mode: {mode}")
