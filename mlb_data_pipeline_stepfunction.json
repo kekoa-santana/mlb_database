@@ -1,43 +1,61 @@
 {
-  "Comment": "Multi‐year MLB backfill, one day per iteration",
-  "StartAt": "MapOverDates",
+  "Comment": "Backfill Statcast + Boxscore day-by-day via mlb-deps-ecr",
+  "StartAt": "BackfillPerDay",
   "States": {
-    "MapOverDates": {
+    "BackfillPerDay": {
       "Type": "Map",
       "ItemsPath": "$.dates",
       "MaxConcurrency": 5,
+      "ItemSelector": {
+        "mode": "historical_raw",
+        "start_date.$": "$$.Map.Item.Value",
+        "end_date.$": "$$.Map.Item.Value"
+      },
       "Iterator": {
-        "StartAt": "BackfillOneDay",
+        "StartAt": "InvokeBackfill",
         "States": {
-          "BackfillOneDay": {
+          "InvokeBackfill": {
             "Type": "Task",
-            "Resource": "arn:aws:lambda:us-east-2:227271426748:function:mlb-deps-ecr",
-            "TimeoutSeconds": 900,
+            "Resource": "arn:aws:states:::lambda:invoke",
             "Parameters": {
-              "mode": "historical_raw",
-              "start_date.$": "$$.Map.Item.Value",
-              "end_date.$":   "$$.Map.Item.Value"
+              "FunctionName": "arn:aws:lambda:us-east-2:227271426748:function:mlb-deps-ecr",
+              "Payload.$": "$",
+              "InvocationType": "RequestResponse"
             },
-            "Retry": [{
-              "ErrorEquals":   ["States.ALL"],
-              "IntervalSeconds": 30,
-              "MaxAttempts":     2,
-              "BackoffRate":     2.0
-            }],
-            "Catch": [{
-              "ErrorEquals": ["States.ALL"],
-              "ResultPath":  "$.errorInfo",
-              "Next":        "RecordFailure"
-            }],
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "States.TaskFailed"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              },
+              {
+                "ErrorEquals": [
+                  "ThrottlingException",
+                  "TooManyRequestsException"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 6,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": null,
+                "Next": "SkipFailedDay"
+              }
+            ],
             "End": true
           },
-          "RecordFailure": {
+          "SkipFailedDay": {
             "Type": "Pass",
-            "Parameters": {
-              "failedDate.$": "$$.Map.Item.Value",
-              "error.$":      "$.errorInfo"
-            },
-            "ResultPath": "$.failures[0]",
             "End": true
           }
         }

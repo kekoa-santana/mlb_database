@@ -8,8 +8,6 @@ import pandas as pd
 env_path = os.path.join(os.path.dirname(__file__), "config", ".env")
 load_dotenv(dotenv_path=env_path)
 
-print("ENV VARS:", dict(os.environ))
-
 from lambda_utils import (
     create_database_tables,
     lambda_response,
@@ -150,6 +148,16 @@ def lambda_handler(event, context):
             end_date = datetime.strptime(ed_str, "%Y-%m-%d").date()
 
             logger.info(f"Starting historical backfill from {start_date} to {end_date}")
+
+            # Generate all dates in range
+            dates_to_process = []
+            current_date = start_date
+            while current_date <= end_date:
+                dates_to_process.append(current_date)
+                current_date += timedelta(days=1)
+            
+            logger.info(f"Processing {len(dates_to_process)} dates")
+
 
             # Process each date invidually
             all_results = {
